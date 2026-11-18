@@ -2,6 +2,11 @@
 """
 pico2ps - transpileur d'un sous-ensemble de PICO-8 (Lua) vers PowerShell.
 
+Version 2.2 :
+  - concatenation .. aplatie en une seule expression (lisibilite)
+  - _mathx_noise : hash sorti du scriptblock, deterministe et plus rapide
+  - _crypto_rng : rejection sampling (tirage uniforme au bit pres)
+
 Usage :
     python pico2ps.py jeu.p8            -> jeu.ps1
     python pico2ps.py jeu.lua -o out.ps1
@@ -36,7 +41,6 @@ pas de goto, pas de retours multiples ; `a or b` renvoie un booleen (pas la vale
 import argparse
 import os
 import re
-import shutil
 import sys
 
 
@@ -732,8 +736,6 @@ BUILTINS['t'] = '_time'
 
 # ----------------------------------------------------------------------------
 # Bibliotheque systeme : modules PowerShell injectes a la demande
-# Convention : fonction PowerShell  _<module>_<nom>  <->  appel PICO-8  <module>_<nom>
-# Les helpers internes n'ont qu'un seul underscore (_abs, _rec, _list...).
 # ----------------------------------------------------------------------------
 SYS_MODULES = {}
 
@@ -767,7 +769,7 @@ function _list($items) {
 }
 '''
 
-# --- NOUVEAU : crypto (integrite, alea, coffre-fort AES-GCM) ---
+# --- crypto (inchange hors _crypto_rng, voir plus bas) ---
 SYS_MODULES['crypto'] = r'''
 # --- crypto : integrite, alea cryptographique, coffre-fort -----------------
 function _crypto_hash($s, $algo = 'SHA256') {
@@ -786,13 +788,20 @@ function _crypto_hmac($s, $key, $algo = 'SHA256') {
     } catch { _warn $_; return $null }
 }
 function _crypto_rng($a = 0, $b = 1) {
+    # Rejection sampling : tirage uniforme au bit pres (pas de biais modulo).
     if (_dry 'crypto_rng') { return [int64]$a }
-    $bytes = New-Object byte[] 8
-    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-    $n = [BitConverter]::ToUInt64($bytes, 0)
     $lo = [int64]$a; $hi = [int64]$b
     if ($hi -lt $lo) { $tmp = $lo; $lo = $hi; $hi = $tmp }
-    return [int64]($lo + ($n % ([uint64]($hi - $lo + 1))))
+    $range = [uint64]($hi - $lo + 1)
+    $max = [uint64]::MaxValue
+    $rej = $max - ($max % $range)
+    $bytes = New-Object byte[] 8
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    while ($true) {
+        $rng.GetBytes($bytes)
+        $n = [BitConverter]::ToUInt64($bytes, 0)
+        if ($n -lt $rej) { return [int64]($lo + [int64]($n % $range)) }
+    }
 }
 function _crypto_uuid() {
     if (_dry 'crypto_uuid') { return '00000000-0000-0000-0000-000000000000' }
@@ -826,7 +835,7 @@ function _crypto_open($b64, $keyString) {
 }
 '''
 
-# --- NOUVEAU : mathx (geometrie douce, interpolation, bruit organique) ---
+# --- mathx (noise refondu : _mhash sorti du scriptblock) ---
 SYS_MODULES['mathx'] = r'''
 # --- mathx : geometrie douce, interpolation, bruit organique ---------------
 function _mathx_clamp($v, $lo, $hi) {
@@ -844,17 +853,16 @@ function _mathx_dist($x1, $y1, $x2, $y2) {
     $dx = $x2 - $x1; $dy = $y2 - $y1
     return [math]::Sqrt($dx * $dx + $dy * $dy)
 }
+function _mhash($n, $seed) {
+    $n = ([int64]$n * 374761393 + [int64]$seed) -band 0xFFFFFFFF
+    $n = (($n -bxor ($n -shr 13)) * 1274126177) -band 0xFFFFFFFF
+    return (($n % 2001) / 1000.0) - 1.0
+}
 function _mathx_noise($x, $seed = 0) {
     $xi = [math]::Floor($x)
     $xf = _mathx_smooth ($x - $xi)
-    $h = {
-        param($n)
-        $n = ([int64]$n * 374761393 + [int64]$seed) -band 0xFFFFFFFF
-        $n = (($n -bxor ($n -shr 13)) * 1274126177) -band 0xFFFFFFFF
-        return (($n % 2001) / 1000.0) - 1.0
-    }
-    $n1 = & $h $xi
-    $n2 = & $h ($xi + 1)
+    $n1 = _mhash $xi $seed
+    $n2 = _mhash ($xi + 1) $seed
     return (_mathx_lerp $n1 $n2 $xf)
 }
 '''
@@ -1822,6 +1830,15 @@ class Gen:
     def paren(c):
         return c if c.startswith('(') else f'({c})'
 
+    # --- PATCH 1 : concatenation .. aplatie en une seule expression ---
+    def _flatten_concat(self, e, parts):
+        """Recolte les operandes d'une chaine gauche-associative de '..'."""
+        if e[0] == 'bin' and e[1] == '..':
+            self._flatten_concat(e[2], parts)
+            self._flatten_concat(e[3], parts)
+        else:
+            parts.append(e)
+
     def expr(self, e):
         k = e[0]
         if k == 'num':
@@ -1863,6 +1880,13 @@ class Gen:
             op, l, r = e[1], e[2], e[3]
             if op in ('and', 'or'):
                 return f'({self.cond(l)} -{op} {self.cond(r)})'
+            if op == '..':
+                parts = []
+                self._flatten_concat(e, parts)
+                pieces = [f'(_tostr {self.expr(p)})' for p in parts]
+                if len(pieces) == 1:
+                    return pieces[0]
+                return '(' + ' + '.join(pieces) + ')'
             L, R = self.expr(l), self.expr(r)
             if op in CMP:
                 return f'({L} {CMP[op]} {R})'
@@ -1874,8 +1898,6 @@ class Gen:
                 return f'([math]::Floor({L} / {R}))'
             if op == '^':
                 return f'([math]::Pow({L}, {R}))'
-            if op == '..':
-                return f'((_tostr {L}) + (_tostr {R}))'
             if op in BITOPS:
                 return f'([int]{L} {BITOPS[op]} [int]{R})'
         raise TranspileError(f'expression non geree: {e}')
@@ -2115,7 +2137,7 @@ def transpile(src, loop=False):
 
 def main():
     ap = argparse.ArgumentParser(
-        description='Transpile PICO-8 (Lua) vers PowerShell (v2.1 Vivant)')
+        description='Transpile PICO-8 (Lua) vers PowerShell (v2.2 Vivant)')
     ap.add_argument('input', nargs='?')
     ap.add_argument('--api', action='store_true',
                     help='liste les fonctions systeme disponibles')
