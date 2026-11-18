@@ -6,6 +6,10 @@ Usage :
     python pico2ps.py jeu.p8            -> jeu.ps1
     python pico2ps.py jeu.lua -o out.ps1
     python pico2ps.py jeu.p8 --loop     -> ajoute la boucle _init/_update/_draw
+    python pico2ps.py jeu.p8 --stats    -> statistiques AST
+    python pico2ps.py jeu.p8 --check    -> parse sans ecrire
+    python pico2ps.py --list-modules    -> modules disponibles
+    python pico2ps.py --api             -> fonctions systeme detaillees
 
 Sous-ensemble supporte :
   * variables locales/globales, nombres (dec, 0x, 0b), chaines, true/false/nil
@@ -18,7 +22,9 @@ Sous-ensemble supporte :
   * builtins : flr ceil abs sqrt min max mid sgn rnd srand sin cos atan2 sub tostr
              tonum chr ord split add del deli count all pairs foreach print printh
              cls time t flip
-  * bibliotheque systeme (python pico2ps.py --api pour la liste complete) :
+  * bibliotheque systeme :
+      crypto_hash crypto_hmac crypto_rng crypto_uuid crypto_seal crypto_open
+      mathx_clamp mathx_lerp mathx_smooth mathx_map mathx_dist mathx_noise
       fs_* fichiers   reg_* registre   net_* reseau   task_* planificateur
       disk_* disques  proc_* processus svc_* services  upd_* mises a jour
       sys_* systeme   serial_* / usb_* materiel   json_* / str_* utilitaires
@@ -27,37 +33,132 @@ Sous-ensemble supporte :
 Limites connues : pas de closures/fonctions anonymes, pas de methodes (a:b()),
 pas de goto, pas de retours multiples ; `a or b` renvoie un booleen (pas la valeur).
 """
-import re
-import sys
 import argparse
+import os
+import re
+import shutil
+import sys
 
 
+# ----------------------------------------------------------------------------
+# Palette Feng-Shui (activee si stdout est un terminal et pas de NO_COLOR)
+# ----------------------------------------------------------------------------
+class Palette:
+    def __init__(self):
+        self.on = (os.environ.get('NO_COLOR') is None
+                   and hasattr(sys.stdout, 'isatty')
+                   and sys.stdout.isatty())
+        if self.on:
+            self.reset = '\x1b[0m'
+            self.dim = '\x1b[2m'
+            self.bold = '\x1b[1m'
+            self.jade = '\x1b[38;5;79m'
+            self.zin = '\x1b[38;5;110m'
+            self.sand = '\x1b[38;5;180m'
+            self.rose = '\x1b[38;5;210m'
+            self.ink = '\x1b[38;5;245m'
+            self.warn = '\x1b[38;5;215m'
+            self.err = '\x1b[38;5;203m'
+            self.ok = '\x1b[38;5;114m'
+        else:
+            for a in ('reset', 'dim', 'bold', 'jade', 'zin', 'sand', 'rose',
+                      'ink', 'warn', 'err', 'ok'):
+                setattr(self, a, '')
+
+
+PAL = Palette()
+
+
+def banner():
+    if not PAL.on:
+        return
+    print(f'{PAL.zin}   ╭─ {PAL.bold}pico2ps{PAL.reset}'
+          f'{PAL.zin} ── souffle de code ─╮{PAL.reset}')
+    print(f'{PAL.ink}   │  Lua → PowerShell · respiration & métabolisme  │{PAL.reset}')
+    print(f'{PAL.zin}   ╰────────────────────────────────────────────────╯{PAL.reset}')
+    print()
+
+
+def phase(n, total, title):
+    if not PAL.on:
+        return
+    bar_len = 24
+    filled = int(bar_len * n / total)
+    bar = f'{PAL.jade}{"▰" * filled}{PAL.ink}{"▱" * (bar_len - filled)}{PAL.reset}'
+    print(f'  {bar}  {PAL.zin}{n}/{total}{PAL.reset}  {PAL.sand}{title}{PAL.reset}')
+
+
+def whisper(msg):
+    if PAL.on:
+        print(f'  {PAL.ink}· {msg}{PAL.reset}')
+
+
+def note(msg):
+    if PAL.on:
+        print(f'  {PAL.zin}✦ {msg}{PAL.reset}')
+    else:
+        print(msg)
+
+
+def caution(msg):
+    if PAL.on:
+        print(f'  {PAL.warn}⚠ {msg}{PAL.reset}', file=sys.stderr)
+    else:
+        print(f'Avertissement: {msg}', file=sys.stderr)
+
+
+def hush(msg):
+    if PAL.on:
+        print(f'  {PAL.err}✗ {msg}{PAL.reset}', file=sys.stderr)
+    else:
+        print(f'Erreur: {msg}', file=sys.stderr)
+
+
+# ----------------------------------------------------------------------------
+# Erreur de transpilation (avec contexte exploitable par l'affichage)
+# ----------------------------------------------------------------------------
 class TranspileError(Exception):
-    pass
+    def __init__(self, msg, line=None, col=None):
+        super().__init__(msg)
+        self.msg, self.line, self.col = msg, line, col
+
+    def render(self, source_lines=None):
+        if not PAL.on:
+            loc = f' (ligne {self.line})' if self.line else ''
+            return f'{self.msg}{loc}'
+        out = [f'{PAL.err}✗ {self.msg}{PAL.reset}']
+        if self.line:
+            out.append(f'  {PAL.ink}ligne {self.line}{PAL.reset}')
+        if source_lines and self.line and 1 <= self.line <= len(source_lines):
+            txt = source_lines[self.line - 1]
+            out.append(f'  {PAL.sand}{txt}{PAL.reset}')
+            if self.col:
+                out.append('  ' + ' ' * (self.col - 1) + f'{PAL.rose}^{PAL.reset}')
+        return '\n'.join(out)
 
 
 # ----------------------------------------------------------------------------
 # Lexer
 # ----------------------------------------------------------------------------
-KEYWORDS = {'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for', 'function',
-            'goto', 'if', 'in', 'local', 'nil', 'not', 'or', 'repeat', 'return', 'then',
-            'true', 'until', 'while'}
+KEYWORDS = {'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for',
+            'function', 'goto', 'if', 'in', 'local', 'nil', 'not', 'or',
+            'repeat', 'return', 'then', 'true', 'until', 'while'}
 OPS3 = ['^^=', '..=']
-OPS2 = ['^^', '<<', '>>', '<=', '>=', '==', '~=', '!=', '..', '+=', '-=', '*=', '/=',
-        '%=', '\\=', '^=', '|=', '&=']
+OPS2 = ['^^', '<<', '>>', '<=', '>=', '==', '~=', '!=', '..', '+=', '-=',
+        '*=', '/=', '%=', '\\=', '^=', '|=', '&=']
 OPS1 = set('+-*/%\\^#<>=(){}[];,.:&|~?')
 NUM_RE = re.compile(r'0[xX][0-9a-fA-F]+(?:\.[0-9a-fA-F]+)?|0[bB][01]+|'
                     r'(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?')
 NAME_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
-ESCAPES = {'n': '\n', 't': '\t', 'r': '\r', 'a': '\a', 'b': '\b', 'f': '\f', 'v': '\v',
-           '\\': '\\', '"': '"', "'": "'", '0': '\0'}
+ESCAPES = {'n': '\n', 't': '\t', 'r': '\r', 'a': '\a', 'b': '\b',
+           'f': '\f', 'v': '\v', '\\': '\\', '"': '"', "'": "'", '0': '\0'}
 
 
 class Tok:
-    __slots__ = ('kind', 'val', 'line')
+    __slots__ = ('kind', 'val', 'line', 'col')
 
-    def __init__(self, kind, val, line):
-        self.kind, self.val, self.line = kind, val, line
+    def __init__(self, kind, val, line, col=1):
+        self.kind, self.val, self.line, self.col = kind, val, line, col
 
     def __repr__(self):
         return f'Tok({self.kind},{self.val!r},{self.line})'
@@ -65,55 +166,60 @@ class Tok:
 
 def lex(src):
     toks, i, n, line = [], 0, len(src), 1
+    line_start = 0
     while i < n:
         c = src[i]
         if c == '\n':
             line += 1
+            line_start = i + 1
             i += 1
             continue
         if c in ' \t\r':
             i += 1
             continue
-        # commentaires
         if src.startswith('--', i) or src.startswith('//', i):
             if src.startswith('--[[', i):
                 j = src.find(']]', i + 4)
                 j = n if j < 0 else j + 2
                 line += src.count('\n', i, j)
+                nl = src.rfind('\n', i, j)
+                if nl >= 0:
+                    line_start = nl + 1
                 i = j
             else:
                 j = src.find('\n', i)
                 i = n if j < 0 else j
             continue
-        # chaine longue [[ ... ]]
         if src.startswith('[[', i):
             j = src.find(']]', i + 2)
             if j < 0:
-                raise TranspileError(f'ligne {line}: chaine [[ non terminee')
-            toks.append(Tok('str', src[i + 2:j], line))
+                raise TranspileError('chaine [[ non terminee', line, i - line_start + 1)
+            toks.append(Tok('str', src[i + 2:j], line, i - line_start + 1))
             line += src.count('\n', i, j)
             i = j + 2
             continue
-        # nombres
+        col = i - line_start + 1
         if c.isdigit() or (c == '.' and i + 1 < n and src[i + 1].isdigit()):
             m = NUM_RE.match(src, i)
             txt = m.group(0)
             if txt[:2] in ('0x', '0X'):
-                txt = str(int(txt[2:], 16)) if '.' not in txt else repr(
-                    int(txt[2:].split('.')[0], 16) + int(txt.split('.')[1], 16) / 16 ** len(txt.split('.')[1]))
+                if '.' not in txt:
+                    txt = str(int(txt[2:], 16))
+                else:
+                    ip, fp = txt[2:].split('.')
+                    txt = repr(int(ip, 16) + int(fp, 16) / 16 ** len(fp))
             elif txt[:2] in ('0b', '0B'):
                 txt = str(int(txt[2:], 2))
             elif txt.endswith('.'):
                 txt += '0'
-            toks.append(Tok('num', txt, line))
+            toks.append(Tok('num', txt, line, col))
             i = m.end()
             continue
-        # chaines
         if c in '"\'':
             q, j, buf = c, i + 1, []
             while True:
                 if j >= n or src[j] == '\n':
-                    raise TranspileError(f'ligne {line}: chaine non terminee')
+                    raise TranspileError('chaine non terminee', line, col)
                 ch = src[j]
                 if ch == q:
                     break
@@ -132,21 +238,19 @@ def lex(src):
                 else:
                     buf.append(ch)
                 j += 1
-            toks.append(Tok('str', ''.join(buf), line))
+            toks.append(Tok('str', ''.join(buf), line, col))
             i = j + 1
             continue
-        # noms / mots-cles
         if c.isalpha() or c == '_':
             m = NAME_RE.match(src, i)
             w = m.group(0)
-            toks.append(Tok('kw' if w in KEYWORDS else 'name', w, line))
+            toks.append(Tok('kw' if w in KEYWORDS else 'name', w, line, col))
             i = m.end()
             continue
-        # operateurs
         for ops in (OPS3, OPS2):
             for o in ops:
                 if src.startswith(o, i):
-                    toks.append(Tok('op', o, line))
+                    toks.append(Tok('op', o, line, col))
                     i += len(o)
                     break
             else:
@@ -154,11 +258,11 @@ def lex(src):
             break
         else:
             if c in OPS1:
-                toks.append(Tok('op', c, line))
+                toks.append(Tok('op', c, line, col))
                 i += 1
             else:
-                raise TranspileError(f'ligne {line}: caractere inattendu {c!r}')
-    toks.append(Tok('eof', '<eof>', line))
+                raise TranspileError(f'caractere inattendu {c!r}', line, col)
+    toks.append(Tok('eof', '<eof>', line, 1))
     return toks
 
 
@@ -182,7 +286,6 @@ class Parser:
     def __init__(self, toks):
         self.t, self.p = toks, 0
 
-    # utilitaires
     def peek(self, o=0):
         return self.t[min(self.p + o, len(self.t) - 1)]
 
@@ -206,13 +309,13 @@ class Parser:
             return self.next()
         tk = self.peek()
         want = val or kind
-        raise TranspileError(f'ligne {tk.line}: {want!r} attendu, trouve {tk.val!r}')
+        raise TranspileError(f'{want!r} attendu, trouve {tk.val!r}',
+                             tk.line, tk.col)
 
     def err(self, msg, tk=None):
         tk = tk or self.peek()
-        raise TranspileError(f'ligne {tk.line}: {msg}')
+        raise TranspileError(msg, tk.line, tk.col)
 
-    # structure
     def parse_chunk(self):
         body = self.parse_block()
         if not self.check('eof'):
@@ -221,17 +324,19 @@ class Parser:
 
     def parse_block(self):
         stmts = []
-        while not self.check('eof') and not (self.peek().kind == 'kw' and self.peek().val in BLOCK_END):
+        while (not self.check('eof')
+               and not (self.peek().kind == 'kw'
+                        and self.peek().val in BLOCK_END)):
             s = self.parse_stmt()
             if s:
                 stmts.append(s)
         return stmts
 
     def short_body(self, line):
-        """Corps d'un `if (c) instr` / `while (c) instr` : le reste de la ligne."""
         body = []
         while (not self.check('eof') and self.peek().line == line
-               and not (self.peek().kind == 'kw' and self.peek().val in BLOCK_END)):
+               and not (self.peek().kind == 'kw'
+                        and self.peek().val in BLOCK_END)):
             s = self.parse_stmt()
             if s:
                 body.append(s)
@@ -257,7 +362,8 @@ class Parser:
                 return None
             if tk.val == '?':
                 self.next()
-                return ('callstat', ('call', ('name', 'print'), [self.parse_expr()]))
+                return ('callstat',
+                        ('call', ('name', 'print'), [self.parse_expr()]))
         if tk.kind == 'kw':
             v = tk.val
             if v == 'local':
@@ -338,7 +444,8 @@ class Parser:
             if v == 'return':
                 self.next()
                 nx = self.peek()
-                if (nx.kind == 'eof' or nx.line != tk.line or (nx.kind == 'kw' and nx.val in BLOCK_END)
+                if (nx.kind == 'eof' or nx.line != tk.line
+                        or (nx.kind == 'kw' and nx.val in BLOCK_END)
                         or (nx.kind == 'op' and nx.val == ';')):
                     return ('return', None)
                 e = self.parse_expr()
@@ -355,7 +462,6 @@ class Parser:
                 return ('do', body)
             if v == 'goto':
                 self.err('goto non supporte')
-        # affectation ou appel
         e = self.parse_suffixed()
         nx = self.peek()
         if nx.kind == 'op' and nx.val in ('=', ','):
@@ -368,19 +474,18 @@ class Parser:
                 exprs.append(self.parse_expr())
             for t in targets:
                 if t[0] not in ('name', 'index'):
-                    self.err('cible d\'affectation invalide', tk)
+                    self.err("cible d'affectation invalide", tk)
             return ('assign', targets, exprs)
         if nx.kind == 'op' and nx.val in COMPOUND:
             self.next()
             if e[0] not in ('name', 'index'):
-                self.err('cible d\'affectation invalide', tk)
+                self.err("cible d'affectation invalide", tk)
             rhs = self.parse_expr()
             return ('assign', [e], [('bin', COMPOUND[nx.val], e, rhs)])
         if e[0] == 'call':
             return ('callstat', e)
         self.err('instruction invalide', tk)
 
-    # expressions
     def parse_expr(self, minp=0):
         left = self.parse_unary()
         while True:
@@ -398,7 +503,8 @@ class Parser:
 
     def parse_unary(self):
         tk = self.peek()
-        if (tk.kind == 'kw' and tk.val == 'not') or (tk.kind == 'op' and tk.val in ('-', '#', '~')):
+        if ((tk.kind == 'kw' and tk.val == 'not')
+                or (tk.kind == 'op' and tk.val in ('-', '#', '~'))):
             self.next()
             return ('un', tk.val, self.parse_expr(UNARY_PREC))
         return self.parse_suffixed()
@@ -480,7 +586,7 @@ $script:_t0 = [DateTime]::UtcNow
 function _tostr($v) {
     if ($null -eq $v) { return 'nil' }
     if ($v -is [bool]) { if ($v) { return 'true' } else { return 'false' } }
-    if ($v -is [hashtable]) { return _dump $v 0 }
+    if ($v -is [hashtable] -and $v.ContainsKey('a') -and $v.ContainsKey('h')) { return _dump $v 0 }
     return [string]$v
 }
 function _dump($v, $d) {
@@ -527,9 +633,7 @@ function _tbl($a, $h) {
     $t = _new
     foreach ($v in $a) { [void]$t.a.Add($v) }
     for ($i = 0; $i -lt $h.Count; $i += 2) {
-        $k = $h[$i]
-        $v = $h[$i + 1]
-        _set $t $k $v
+        _set $t $h[$i] $h[$i + 1]
     }
     return $t
 }
@@ -620,9 +724,11 @@ function _flip { Start-Sleep -Milliseconds 33 }
 '''
 
 BUILTINS = {n: '_' + n for n in (
-    'flr ceil abs sqrt min max mid sgn rnd srand sin cos atan2 sub tostr tonum chr ord '
-    'split add del deli count all pairs foreach print printh cls time flip').split()}
+    'flr ceil abs sqrt min max mid sgn rnd srand sin cos atan2 sub tostr tonum '
+    'chr ord split add del deli count all pairs foreach print printh cls time flip'
+).split()}
 BUILTINS['t'] = '_time'
+
 
 # ----------------------------------------------------------------------------
 # Bibliotheque systeme : modules PowerShell injectes a la demande
@@ -658,6 +764,98 @@ function _list($items) {
     $t = _new
     foreach ($i in @($items)) { if ($null -ne $i) { [void]$t.a.Add($i) } }
     return $t
+}
+'''
+
+# --- NOUVEAU : crypto (integrite, alea, coffre-fort AES-GCM) ---
+SYS_MODULES['crypto'] = r'''
+# --- crypto : integrite, alea cryptographique, coffre-fort -----------------
+function _crypto_hash($s, $algo = 'SHA256') {
+    try {
+        $h = [Security.Cryptography.HashAlgorithm]::Create([string]$algo)
+        return (($h.ComputeHash([Text.Encoding]::UTF8.GetBytes([string]$s)) |
+                 ForEach-Object { $_.ToString('x2') }) -join '')
+    } catch { _warn $_; return $null }
+}
+function _crypto_hmac($s, $key, $algo = 'SHA256') {
+    try {
+        $h = [Security.Cryptography.HMAC]::Create([string]$algo)
+        $h.Key = [Text.Encoding]::UTF8.GetBytes([string]$key)
+        return (($h.ComputeHash([Text.Encoding]::UTF8.GetBytes([string]$s)) |
+                 ForEach-Object { $_.ToString('x2') }) -join '')
+    } catch { _warn $_; return $null }
+}
+function _crypto_rng($a = 0, $b = 1) {
+    if (_dry 'crypto_rng') { return [int64]$a }
+    $bytes = New-Object byte[] 8
+    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    $n = [BitConverter]::ToUInt64($bytes, 0)
+    $lo = [int64]$a; $hi = [int64]$b
+    if ($hi -lt $lo) { $tmp = $lo; $lo = $hi; $hi = $tmp }
+    return [int64]($lo + ($n % ([uint64]($hi - $lo + 1))))
+}
+function _crypto_uuid() {
+    if (_dry 'crypto_uuid') { return '00000000-0000-0000-0000-000000000000' }
+    return [guid]::NewGuid().ToString()
+}
+function _crypto_seal($plaintext, $keyString) {
+    if (_dry 'crypto_seal') { return 'DRYRUN_SEALED' }
+    try {
+        $keyBytes = [Text.Encoding]::UTF8.GetBytes(([string]$keyString).PadRight(32, '0').Substring(0, 32))
+        $aes = [Security.Cryptography.AesGcm]::new($keyBytes)
+        $nonce = New-Object byte[] 12
+        [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($nonce)
+        $pt = [Text.Encoding]::UTF8.GetBytes([string]$plaintext)
+        $ct = New-Object byte[] $pt.Length
+        $tag = New-Object byte[] 16
+        $aes.Encrypt($nonce, $pt, $ct, $tag)
+        return [Convert]::ToBase64String($nonce + $tag + $ct)
+    } catch { _warn $_; return $null }
+}
+function _crypto_open($b64, $keyString) {
+    if (_dry 'crypto_open') { return 'DRYRUN_OPENED' }
+    try {
+        $keyBytes = [Text.Encoding]::UTF8.GetBytes(([string]$keyString).PadRight(32, '0').Substring(0, 32))
+        $aes = [Security.Cryptography.AesGcm]::new($keyBytes)
+        $raw = [Convert]::FromBase64String([string]$b64)
+        $nonce = $raw[0..11]; $tag = $raw[12..27]; $ct = $raw[28..($raw.Length - 1)]
+        $pt = New-Object byte[] $ct.Length
+        $aes.Decrypt($nonce, $ct, $tag, $pt)
+        return [Text.Encoding]::UTF8.GetString($pt)
+    } catch { _warn $_; return $null }
+}
+'''
+
+# --- NOUVEAU : mathx (geometrie douce, interpolation, bruit organique) ---
+SYS_MODULES['mathx'] = r'''
+# --- mathx : geometrie douce, interpolation, bruit organique ---------------
+function _mathx_clamp($v, $lo, $hi) {
+    if ($v -lt $lo) { return $lo }
+    if ($v -gt $hi) { return $hi }
+    return $v
+}
+function _mathx_lerp($a, $b, $t) { return ($a + ($b - $a) * $t) }
+function _mathx_smooth($t) { return ($t * $t * (3 - 2 * $t)) }
+function _mathx_map($v, $i0, $i1, $o0, $o1) {
+    if ($i1 -eq $i0) { return $o0 }
+    return ($o0 + ($o1 - $o0) * (($v - $i0) / ($i1 - $i0)))
+}
+function _mathx_dist($x1, $y1, $x2, $y2) {
+    $dx = $x2 - $x1; $dy = $y2 - $y1
+    return [math]::Sqrt($dx * $dx + $dy * $dy)
+}
+function _mathx_noise($x, $seed = 0) {
+    $xi = [math]::Floor($x)
+    $xf = _mathx_smooth ($x - $xi)
+    $h = {
+        param($n)
+        $n = ([int64]$n * 374761393 + [int64]$seed) -band 0xFFFFFFFF
+        $n = (($n -bxor ($n -shr 13)) * 1274126177) -band 0xFFFFFFFF
+        return (($n % 2001) / 1000.0) - 1.0
+    }
+    $n1 = & $h $xi
+    $n2 = & $h ($xi + 1)
+    return (_mathx_lerp $n1 $n2 $xf)
 }
 '''
 
@@ -846,8 +1044,9 @@ function _reg_values($p) {
         $t = _new
         foreach ($n in $k.GetValueNames()) {
             $v = $k.GetValue($n)
-            if ($n -eq '') { $n = '(default)' }
-            _set $t $n $v
+            $nn = $n
+            if ($nn -eq '') { $nn = '(default)' }
+            _set $t $nn $v
         }
         return $t
     } catch { _warn $_; return $null }
@@ -1474,9 +1673,8 @@ function _str_hash($s, $algo = 'SHA256') {
 def _sys_builtins():
     out = {}
     for mod, code in SYS_MODULES.items():
-        for m in re.finditer(r'^function _(\w+)', code, re.M):
-            if m.group(1).startswith(mod + '_'):
-                out[m.group(1)] = '_' + m.group(1)
+        for m in re.finditer(r'^function _(' + mod + r'_\w+)', code, re.M):
+            out[m.group(1)] = '_' + m.group(1)
     return out
 
 
@@ -1491,15 +1689,17 @@ def api_listing():
             continue
         lines.append(f'[{mod}]')
         for m in re.finditer(r'^function _(' + mod + r'_\w+)\s*\((.*?)\)\s*\{', code, re.M):
-            params = re.sub(r'\s*=\s*', '=', m.group(2).replace('$', '')).replace('null', 'nil')
+            params = re.sub(r'\s*=\s*', '=', m.group(2).replace('$', ''))
             lines.append(f'  {m.group(1)}({params})')
     return '\n'.join(lines)
 
-RESERVED = {'args', 'input', 'error', 'host', 'home', 'pid', 'pwd', 'true', 'false', 'null',
-            'this', 'matches', 'profile', 'shellid', 'event', 'sender', 'foreach', 'switch',
-            'psitem', 'myinvocation', 'pscmdlet', 'executioncontext', 'lastexitcode',
-            'stacktrace', 'psversiontable', 'env', 'pshome', 'ofs', 'confirmpreference',
-            'verbosepreference', 'debugpreference', 'erroractionpreference', 'dryrun'}
+
+RESERVED = {'args', 'input', 'error', 'host', 'home', 'pid', 'pwd', 'true', 'false',
+            'null', 'this', 'matches', 'profile', 'shellid', 'event', 'sender',
+            'foreach', 'switch', 'psitem', 'myinvocation', 'pscmdlet',
+            'executioncontext', 'lastexitcode', 'stacktrace', 'psversiontable',
+            'env', 'pshome', 'ofs', 'confirmpreference', 'verbosepreference',
+            'debugpreference', 'erroractionpreference', 'dryrun'}
 CMP = {'==': '-eq', '~=': '-ne', '!=': '-ne', '<': '-lt', '<=': '-le', '>': '-gt', '>=': '-ge'}
 BITOPS = {'&': '-band', '|': '-bor', '^^': '-bxor', '<<': '-shl', '>>': '-shr'}
 
@@ -1535,9 +1735,6 @@ def const_num(e):
     return None
 
 
-# ----------------------------------------------------------------------------
-# Generateur
-# ----------------------------------------------------------------------------
 def walk(stmts, fn):
     for s in stmts:
         fn(s)
@@ -1559,16 +1756,19 @@ def walk(stmts, fn):
             walk(s[3], fn)
 
 
+# ----------------------------------------------------------------------------
+# Generateur
+# ----------------------------------------------------------------------------
 class Gen:
     def __init__(self, ast):
         self.funcs, self.varnames = set(), set()
         self.warnings = []
         self.used_mods = set()
+        self.used_syms = set()
 
         def collect(s):
             if s[0] == 'func':
                 self.funcs.add(s[1])
-                self.varnames.update(())
             elif s[0] == 'local':
                 self.varnames.update(s[1])
             elif s[0] == 'assign':
@@ -1583,13 +1783,13 @@ class Gen:
         self.lines, self.ind = [], 0
         self.scopes, self.in_func, self.tmp = [set()], False, 0
 
-    # utilitaires
     def emit(self, s):
         self.lines.append('    ' * self.ind + s)
 
     def use(self, n):
         if n in SYS_BUILTINS:
             self.used_mods.add(n.split('_')[0])
+            self.used_syms.add(n)
 
     def new_tmp(self):
         self.tmp += 1
@@ -1606,7 +1806,6 @@ class Gen:
             return '$script:' + safe(n)
         return '$' + safe(n)
 
-    # expressions
     def cond(self, e):
         k = e[0]
         if k == 'bool':
@@ -1638,7 +1837,7 @@ class Gen:
             if not self.is_local(n) and n not in self.varnames:
                 if n in self.funcs:
                     return f"'fn_{n}'"
-                if n in BUILTINS:          # ex: foreach(t, print)
+                if n in BUILTINS:
                     self.use(n)
                     return f"'{BUILTINS[n]}'"
             return self.var(n)
@@ -1697,7 +1896,6 @@ class Gen:
                     return f'(fn_{n}{argstr})'
         return f'(& {self.expr(callee)}{argstr})'
 
-    # instructions
     def block(self, stmts):
         self.scopes.append(set())
         for s in stmts:
@@ -1790,7 +1988,8 @@ class Gen:
         _, name, start, stop, step, body = s
         st_val = self.expr(start)
         n = self.tmp = self.tmp + 1
-        cstop, cstep = const_num(stop), (1.0 if step is None else const_num(step))
+        cstop = const_num(stop)
+        cstep = 1.0 if step is None else const_num(step)
         if cstop is not None:
             e_val = self.expr(stop)
         else:
@@ -1815,7 +2014,8 @@ class Gen:
 
     def gen_forin(self, s):
         _, names, e, body = s
-        if not (e[0] == 'call' and e[1][0] == 'name' and e[1][1] in ('all', 'pairs')
+        if not (e[0] == 'call' and e[1][0] == 'name'
+                and e[1][1] in ('all', 'pairs')
                 and len(e[2]) == 1 and not self.is_local(e[1][1])):
             raise TranspileError('for ... in : seuls all(t) et pairs(t) sont supportes')
         src = self.expr(e[2][0])
@@ -1855,7 +2055,7 @@ class Gen:
     def generate(self, loop=False):
         funcs = [s for s in self.ast if s[0] == 'func']
         rest = [s for s in self.ast if s[0] != 'func']
-        for f in funcs:                       # fonctions "hissees" en tete
+        for f in funcs:
             self.gen_func(f)
             self.emit('')
         self.scopes = [set()]
@@ -1876,6 +2076,17 @@ class Gen:
         return '\n'.join(self.lines) + '\n'
 
 
+def ast_stats(ast):
+    counts = {}
+
+    def fn(s):
+        k = s[0]
+        counts[k] = counts.get(k, 0) + 1
+
+    walk(ast, fn)
+    return counts
+
+
 def extract_lua(text):
     """Si le fichier est une cartouche .p8, ne garde que la section __lua__."""
     m = re.search(r'^__lua__\s*$', text, re.M)
@@ -1892,42 +2103,118 @@ def transpile(src, loop=False):
     body = gen.generate(loop)
     parts = ['# Genere par pico2ps - ne pas editer a la main\n']
     mods = [m for m in SYS_MODULES if m != 'core' and m in gen.used_mods]
-    if mods:   # param() doit etre la premiere instruction du script
+    if mods:
         parts.append('[CmdletBinding()]\nparam([switch]$DryRun)\n')
     parts.append(RUNTIME)
     if mods:
         parts.append(SYS_MODULES['core'])
         parts.extend(SYS_MODULES[m] for m in mods)
     parts.append('\n' + body)
-    return ''.join(parts), gen.warnings
+    return ''.join(parts), gen.warnings, gen.used_mods, gen.used_syms
 
 
 def main():
-    ap = argparse.ArgumentParser(description='Transpile PICO-8 (Lua) vers PowerShell')
+    ap = argparse.ArgumentParser(
+        description='Transpile PICO-8 (Lua) vers PowerShell (v2.1 Vivant)')
     ap.add_argument('input', nargs='?')
     ap.add_argument('--api', action='store_true',
                     help='liste les fonctions systeme disponibles')
+    ap.add_argument('--list-modules', action='store_true',
+                    help='liste les modules et leurs fonctions')
     ap.add_argument('-o', '--output')
     ap.add_argument('--loop', action='store_true',
                     help='ajoute la boucle _init/_update/_draw')
+    ap.add_argument('--stats', action='store_true',
+                    help='affiche les statistiques AST')
+    ap.add_argument('--check', action='store_true',
+                    help='parse sans ecrire de fichier')
+    ap.add_argument('--no-progress', action='store_true',
+                    help='desactive la barre de progression')
     a = ap.parse_args()
+
     if a.api:
         print(api_listing())
         return
+    if a.list_modules:
+        for mod in SYS_MODULES:
+            if mod == 'core':
+                continue
+            fns = [m.group(1) for m in re.finditer(
+                r'^function _(' + mod + r'_\w+)', SYS_MODULES[mod], re.M)]
+            if PAL.on:
+                print(f'{PAL.zin}{mod}{PAL.reset} : ' + ', '.join(fns))
+            else:
+                print(f'{mod} : ' + ', '.join(fns))
+        return
     if not a.input:
         ap.error('fichier source requis')
-    with open(a.input, encoding='utf-8') as f:
-        src = f.read()
+
+    progress = not a.no_progress
+    if progress:
+        banner()
+    T = 5
+
     try:
-        out, warns = transpile(src, a.loop)
+        with open(a.input, encoding='utf-8') as f:
+            src = f.read()
+        if progress:
+            phase(1, T, f'lecture {a.input}')
+        lua = extract_lua(src)
+        src_lines = lua.splitlines()
+
+        if progress:
+            phase(2, T, 'lexage')
+        toks = lex(lua)
+
+        if progress:
+            phase(3, T, 'parsing')
+        ast = Parser(toks).parse_chunk()
+
+        if a.stats:
+            st = ast_stats(ast)
+            note('AST : ' + ', '.join(f'{k}×{v}' for k, v in sorted(st.items())))
+
+        if progress:
+            phase(4, T, 'transpilation')
+        gen = Gen(ast)
+        body = gen.generate(a.loop)
+
+        if progress:
+            phase(5, T, 'assemblage des modules')
+        parts = ['# Genere par pico2ps - ne pas editer a la main\n']
+        mods = [m for m in SYS_MODULES if m != 'core' and m in gen.used_mods]
+        if mods:
+            parts.append('[CmdletBinding()]\nparam([switch]$DryRun)\n')
+        parts.append(RUNTIME)
+        if mods:
+            parts.append(SYS_MODULES['core'])
+            parts.extend(SYS_MODULES[m] for m in mods)
+        parts.append('\n' + body)
+        out = ''.join(parts)
+
+        for w in gen.warnings:
+            caution(w)
+        if gen.used_syms:
+            whisper(f'{len(gen.used_syms)} symbole(s) système : '
+                    + ', '.join(sorted(gen.used_syms)))
+        if mods:
+            whisper(f'modules injectés : {", ".join(sorted(mods))}')
+
+        if a.check:
+            note('check OK (aucun fichier écrit)')
+            return
+
+        path = a.output or re.sub(r'\.[^.]+$', '', a.input) + '.ps1'
+        with open(path, 'w', encoding='utf-8-sig', newline='\r\n') as f:
+            f.write(out)
+        note(f'→ {path}')
+
     except TranspileError as e:
-        sys.exit(f'Erreur: {e}')
-    path = a.output or re.sub(r'\.[^.]+$', '', a.input) + '.ps1'
-    with open(path, 'w', encoding='utf-8-sig', newline='\r\n') as f:
-        f.write(out)
-    for w in warns:
-        print('Avertissement:', w, file=sys.stderr)
-    print(f'OK -> {path}')
+        hush(e.render(src_lines if 'src_lines' in locals() else None))
+        sys.exit(1)
+    except FileNotFoundError:
+        hush(f'fichier introuvable : {a.input}')
+        sys.exit(1)
 
 
 if __name__ == '__main__':
