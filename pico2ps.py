@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """
-pico2ps v3.0 « Germe » - transpileur d'un sous-ensemble de PICO-8 (Lua) vers PowerShell.
+pico2ps v3.1 « Cartographe » - transpileur d'un sous-ensemble de PICO-8 (Lua) vers PowerShell.
 
-Correctifs v3.0 :
-  - '//' est la division entiere (Lua 5.3), plus un commentaire (bug v2.3 :
-    '//' avalait la fin de ligne)
+Nouveautes v3.1 (par rapport a v3.0) :
+  - --graph / --graph-only : export d'un script Cypher Neo4j qui cartographie
+    le metabolisme du script (script, modules injectes, fonctions, builtins,
+    variables locales, aretes CALLS/BINDS/EXPRESSES/REQUIRES_METABOLISM).
+  - propriete 'risk' (low/medium/high) sur les builtins, pour colorer le graphe.
+  - 'frequency' sur les aretes CALLS (1 par defaut, incrementee par MERGE).
+  - noms echappes pour Cypher (quotes simples, identifiants).
+
+Toutes les corrections v3.0 sont conservees :
+  - '//' est la division entiere (Lua 5.3)
   - comparaisons sensibles a la casse : -ceq -cne -clt -cle -cgt -cge
-    (v2.3 : -eq insensible a la casse -> "abc" == "ABC" etait vrai)
-  - tables detectees par marqueur de type 'PicoTable' (v2.3 : presence des
-    cles 'a'+'h' -> une table {a=1,h=2} etait confondue avec une table interne)
-  - and/or preservent les valeurs en position d'expression (court-circuit)
-  - retours multiples : 'return a, b' et 'local a,b = f()' (deballage)
-  - chaines longues a niveaux [=[ ... ]=] et commentaires --[=[ ... ]=]
-  - crypto : KDF PBKDF2-SHA256, sel aleatoire, repli AES-CBC + HMAC-SHA256
-    (encrypt-then-MAC) quand AesGcm est indisponible (PS 5.1), format P2S1
-  - crypto_rng sans debordement (BigInteger)
-  - 'for' a pas nul refuse ; print/printh joignent tous les arguments ;
-    tonum accepte l'hexadecimal ; split retourne des chaines ; ord/rnd gares
-  - nouveau module 'path' ; --version ; detection services sensibles elargie
-    a toutes les chaines litterales de l'AST
+  - tables detectees par marqueur 'PicoTable'
+  - and/or preservent les valeurs en position d'expression
+  - retours multiples + deballage local a,b = f()
+  - chaines longues [=[ ... ]=] et commentaires --[=[ ... ]=]
+  - crypto : PBKDF2-SHA256, sel, AES-GCM ou repli AES-CBC+HMAC (PS 5.1)
+  - crypto_rng en BigInteger (pas de debordement)
+  - 'for' pas nul refuse ; print/printh joignent leurs arguments ;
+    tonum hex ; split retourne des chaines ; ord/rnd gares
 
 Usage :
     python pico2ps.py jeu.p8            -> jeu.ps1
@@ -26,6 +28,8 @@ Usage :
     python pico2ps.py jeu.p8 --loop     -> ajoute la boucle _init/_update/_draw
     python pico2ps.py jeu.p8 --stats    -> statistiques AST
     python pico2ps.py jeu.p8 --check    -> parse sans ecrire
+    python pico2ps.py jeu.p8 --graph    -> genere aussi jeu.cypher (Neo4j)
+    python pico2ps.py jeu.p8 --graph-only -> uniquement le .cypher
     python pico2ps.py --list-modules    -> modules disponibles
     python pico2ps.py --api             -> fonctions systeme detaillees
     python pico2ps.py --version
@@ -35,11 +39,11 @@ import os
 import re
 import sys
 
-VERSION = "3.0 « Germe »"
+VERSION = "3.1 « Cartographe »"
 
 
 # ----------------------------------------------------------------------------
-# Palette Feng-Shui (activee si stdout est un terminal et pas de NO_COLOR)
+# Palette Feng-Shui
 # ----------------------------------------------------------------------------
 class Palette:
     def __init__(self):
@@ -70,10 +74,10 @@ PAL = Palette()
 def banner():
     if not PAL.on:
         return
-    print(f'{PAL.zin}   ╭─ {PAL.bold}pico2ps v3.0{PAL.reset}'
-          f'{PAL.zin} ── germe de code ─╮{PAL.reset}')
+    print(f'{PAL.zin}   ╭─ {PAL.bold}pico2ps v3.1{PAL.reset}'
+          f'{PAL.zin} ── cartographe de code ─╮{PAL.reset}')
     print(f'{PAL.ink}   │  Lua → PowerShell · croissance & métabolisme   │{PAL.reset}')
-    print(f'{PAL.zin}   ╰────────────────────────────────────────────────╯{PAL.reset}')
+    print(f'{PAL.zin}   ╰──────────────────────────────────────────────────╯{PAL.reset}')
     print()
 
 
@@ -165,7 +169,6 @@ class Tok:
 
 
 def _long_open(src, i):
-    """Si src[i:] ouvre un crochet long ([[ ou [=[ ...), retourne (niveau, debut_contenu)."""
     if i >= len(src) or src[i] != '[':
         return None
     j = i + 1
@@ -192,7 +195,6 @@ def lex(src):
             i += 1
             continue
         if src.startswith('--', i):
-            # commentaire long a niveaux : --[=[ ... ]=]
             lb = _long_open(src, i + 2)
             if lb:
                 lvl, start = lb
@@ -212,7 +214,6 @@ def lex(src):
                 i = n if j < 0 else j
             continue
         col = i - line_start + 1
-        # chaine longue a niveaux : [[ ... ]] ou [=[ ... ]=]
         lb = _long_open(src, i)
         if lb:
             lvl, start = lb
@@ -295,7 +296,7 @@ def lex(src):
 
 
 # ----------------------------------------------------------------------------
-# Parser -> AST (tuples)
+# Parser -> AST
 # ----------------------------------------------------------------------------
 BIN = {'or': (1, 'l'), 'and': (2, 'l'),
        '<': (3, 'l'), '>': (3, 'l'), '<=': (3, 'l'), '>=': (3, 'l'),
@@ -607,7 +608,7 @@ class Parser:
 
 
 # ----------------------------------------------------------------------------
-# Runtime PowerShell (v3)
+# Runtime PowerShell (v3, inchange)
 # ----------------------------------------------------------------------------
 RUNTIME = r'''# --- Runtime pico2ps v3 -----------------------------------------------------
 $script:_t0 = [DateTime]::UtcNow
@@ -780,7 +781,6 @@ function _ord($s, $i = 1) {
     return [int][char]$s[$i - 1]
 }
 function _split($s, $sep = ',') {
-    # v3 : retourne des chaines (semantique Lua), sans conversion implicite
     $t = _new
     if ($null -eq $sep) {
         foreach ($ch in ([string]$s).ToCharArray()) { [void]$t.a.Add([string]$ch) }
@@ -864,7 +864,6 @@ function _crypto_hmac($s, $key, $algo = 'SHA256') {
     } catch { _warn $_; return $null }
 }
 function _kdf($pass, $salt) {
-    # PBKDF2 : 64 octets -> 32 (chiffrement) + 32 (integrite)
     try {
         $pb = [Security.Cryptography.Rfc2898DeriveBytes]::new(
             [string]$pass, $salt, 100000, [Security.Cryptography.HashAlgorithmName]::SHA256)
@@ -879,7 +878,6 @@ function _slice($b, $i, $len) {
     return , $out
 }
 function _crypto_rng($a = 0, $b = 1) {
-    # Rejection sampling uniforme, arithmetique BigInteger : aucun debordement.
     if (_dry 'crypto_rng') { return [int64]$a }
     $lo = [int64]$a; $hi = [int64]$b
     if ($hi -lt $lo) { $tmp = $lo; $lo = $hi; $hi = $tmp }
@@ -887,7 +885,7 @@ function _crypto_rng($a = 0, $b = 1) {
     $max = [System.Numerics.BigInteger]([uint64]::MaxValue)
     $rej = $max - ($max % $range)
     $bytes = New-Object byte[] 9
-    $bytes[8] = 0   # little-endian, octet de poids fort nul -> positif
+    $bytes[8] = 0
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
     while ($true) {
         $rng.GetBytes($bytes)
@@ -901,9 +899,6 @@ function _crypto_uuid() {
     return [guid]::NewGuid().ToString()
 }
 function _crypto_seal($plaintext, $keyString) {
-    # Format P2S1 : magic(4) + ver(1) + salt(16) + [nonce/iv] + tag + ct
-    #   ver 1 : AES-256-GCM, nonce 12, tag 16   (PowerShell 7+ / .NET Core)
-    #   ver 2 : AES-256-CBC + HMAC-SHA256 (encrypt-then-MAC)  (repli PS 5.1)
     if (_dry 'crypto_seal') { return 'DRYRUN_SEALED' }
     try {
         $salt = New-Object byte[] 16
@@ -1837,14 +1832,13 @@ function _str_hash($s, $algo = 'SHA256') {
 '''
 
 
-# --- double cle (avec et sans underscore) ---
 def _sys_builtins():
     out = {}
     for mod, code in SYS_MODULES.items():
         for m in re.finditer(r'^function _(' + mod + r'_\w+)', code, re.M):
-            name = m.group(1)                      # ex: 'svc_stop'
-            out[name] = '_' + name                 # 'svc_stop'  -> _svc_stop
-            out['_' + name] = '_' + name           # '_svc_stop' -> _svc_stop
+            name = m.group(1)
+            out[name] = '_' + name
+            out['_' + name] = '_' + name
     return out
 
 
@@ -1852,7 +1846,6 @@ SYS_BUILTINS = _sys_builtins()
 BUILTINS.update(SYS_BUILTINS)
 
 
-# --- services sensibles signales a titre informatif ---
 SENSITIVE_SERVICES = {
     'wuauserv': 'Windows Update (protégé par WaaSMedic depuis Win10 1809)',
     'waasmedicsvc': 'Windows Update Medic (protection du service WU)',
@@ -1888,8 +1881,6 @@ def walk_iter(node):
 
 
 def check_sensitive_services(ast):
-    """Retourne les services sensibles ciblés : toute chaîne littérale de l'AST
-    est comparée (v2.3 ne scannait que local/assign/arguments d'appel)."""
     found = set()
     for node in walk_iter(('root', ast)):
         if node[0] == 'str' and isinstance(node[1], str):
@@ -1917,7 +1908,6 @@ RESERVED = {'args', 'input', 'error', 'host', 'home', 'pid', 'pwd', 'true', 'fal
             'executioncontext', 'lastexitcode', 'stacktrace', 'psversiontable',
             'env', 'pshome', 'ofs', 'confirmpreference', 'verbosepreference',
             'debugpreference', 'erroractionpreference', 'dryrun'}
-# v3 : comparaisons SENSIBLES A LA CASSE (v2.3 : -eq insensible -> "abc" == "ABC" vrai)
 CMP = {'==': '-ceq', '~=': '-cne', '!=': '-cne', '<': '-clt', '<=': '-cle',
        '>': '-cgt', '>=': '-cge'}
 BITOPS = {'&': '-band', '|': '-bor', '^^': '-bxor', '<<': '-shl', '>>': '-shr'}
@@ -1976,7 +1966,7 @@ def walk(stmts, fn):
 
 
 # ----------------------------------------------------------------------------
-# Generateur (v3)
+# Generateur (v3, inchange)
 # ----------------------------------------------------------------------------
 class Gen:
     def __init__(self, ast):
@@ -2026,7 +2016,6 @@ class Gen:
         return '$' + safe(n)
 
     def cond(self, e):
-        """Expression en position de condition (booléenne)."""
         k = e[0]
         if k == 'bool':
             return '$true' if e[1] else '$false'
@@ -2088,7 +2077,6 @@ class Gen:
                 return f'(-bnot [int]{self.expr(x)})'
         if k == 'bin':
             op, l, r = e[1], e[2], e[3]
-            # v3 : and/or preservent les valeurs (court-circuit via scriptblock)
             if op == 'or':
                 t = self.new_tmp()
                 return (f'(& {{ {t} = {self.expr(l)}; '
@@ -2154,7 +2142,6 @@ class Gen:
         return f'_set {self.expr(target[1])} {self.expr(target[2])} {val}'
 
     def _store(self, n, val, declare):
-        """Ecrit val dans n : nom (str, local/global) ou cible d'AST (tuple : t[i], t.x)."""
         if isinstance(n, tuple):
             self.emit(self.assign_to(n, val))
             return
@@ -2163,7 +2150,6 @@ class Gen:
         self.emit(f'{self.var(n)} = {val}')
 
     def _emit_multi(self, names, exprs, declare):
-        """Affectation locale/multiple, avec deballage d'un appel a retour multiple."""
         if len(names) > 1 and len(exprs) == 1 and exprs[0][0] == 'call':
             tmp = self.new_tmp()
             self.emit(f'{tmp} = {self.expr(exprs[0])}')
@@ -2219,7 +2205,6 @@ class Gen:
         elif k == 'forin':
             self.gen_forin(s)
         elif k == 'return':
-            # v3 : retours multiples -> tableau PowerShell
             if s[1] is None:
                 self.emit('return')
             elif len(s[1]) == 1:
@@ -2338,8 +2323,221 @@ def ast_stats(ast):
     return counts
 
 
+# ----------------------------------------------------------------------------
+# v3.1 : Extracteur de graphe Neo4j (Cypher)
+# ----------------------------------------------------------------------------
+# Niveau de risque par prefixe de builtin (heuristique, sans appel systeme)
+RISK_HIGH = {'sys_reboot', 'sys_shutdown', 'sys_lock', 'svc_stop',
+             'svc_restart', 'svc_mode', 'proc_kill', 'reg_set', 'reg_del',
+             'fs_rm', 'fs_mv', 'upd_install', 'task_del', 'task_add',
+             'disk_optimize', 'disk_scan', 'net_wol', 'serial_talk'}
+RISK_MEDIUM = {'fs_write', 'fs_append', 'fs_cp', 'fs_mkdir', 'fs_link',
+               'fs_cd', 'svc_start', 'reg_export', 'net_download',
+               'net_post', 'json_save', 'task_run', 'task_enable',
+               'upd_winget', 'sys_setenv', 'sys_beep', 'sys_clipset',
+               'proc_start', 'proc_run'}
+
+
+def _cyq(s):
+    """Echappe pour une chaine Cypher entre quotes simples."""
+    return str(s).replace('\\', '\\\\').replace("'", "\\'")
+
+
+def _cyident(s):
+    """Sanitize un nom pour un label Cypher (ASCII, alnum+_)."""
+    return re.sub(r'[^a-zA-Z0-9_]', '_', str(s))
+
+
+def _risk_of(builtin):
+    if builtin in RISK_HIGH:
+        return 'high'
+    if builtin in RISK_MEDIUM:
+        return 'medium'
+    return 'low'
+
+
+def _module_of(builtin):
+    """Module d'origine d'un builtin : 'crypto_hash' -> 'crypto',
+    'print' -> 'runtime', '_svc_stop' -> 'svc'."""
+    n = builtin.lstrip('_')
+    if n in SYS_BUILTINS:
+        n = SYS_BUILTINS[n].lstrip('_')
+    if '_' not in n:
+        return 'runtime'
+    head = n.split('_')[0]
+    if head in SYS_MODULES:
+        return head
+    # builtins runtime sans prefixe de module
+    return 'runtime'
+
+
+def _called_symbols(node):
+    """Retourne l'ensemble des noms de builtins appeles dans un sous-arbre."""
+    out = set()
+    for sub in walk_iter(node):
+        if sub[0] == 'call':
+            callee = sub[1]
+            if callee[0] == 'name':
+                n = callee[1]
+                if n in BUILTINS or n in SYS_BUILTINS:
+                    out.add(n)
+    return out
+
+
+def _local_bindings(node, scope_func_name):
+    """Retourne [(var_name, expr_tuple)] pour tous les 'local' du sous-arbre,
+    sans descendre dans les fonctions imbriquees (les leurs sont traitees a part)."""
+    out = []
+    for sub in walk_iter(node):
+        if sub[0] == 'func':
+            continue
+        if sub[0] == 'local':
+            for i, name in enumerate(sub[1]):
+                expr = sub[2][i] if i < len(sub[2]) else None
+                out.append((name, expr))
+    return out
+
+
+def generate_cypher(ast, gen_info, source_name):
+    """Genere un script Cypher (Neo4j) cartographiant le metabolisme du script."""
+    src_id = _cyident(source_name)
+    lines = []
+
+    lines.append('// ==========================================================')
+    lines.append(f'// GENEALOGIE NUMERIQUE : {source_name}')
+    lines.append(f'// Genere par pico2ps v{VERSION.split()[0]} - Cartographie du reel vivant')
+    lines.append('// Import : coller ce script dans Neo4j Browser / cypher-shell')
+    lines.append('// Modele :')
+    lines.append('//   (:Script)-[:EXPRESSES]->(:Function)')
+    lines.append('//   (:Script)-[:REQUIRES_METABOLISM]->(:Module)')
+    lines.append('//   (:Function)-[:CALLS {frequency, risk}]->(:Builtin)')
+    lines.append('//   (:Function)-[:BINDS]->(:Variable)')
+    lines.append('// ==========================================================\n')
+
+    # --- noeud racine (MERGE pour idempotence) ---
+    lines.append(
+        f"MERGE (s:Script {{name: '{_cyq(source_name)}'}}) "
+        f"ON CREATE SET s.type = 'Genotype', s.language = 'PICO-8/Lua', "
+        f"s.version = '{_cyq(VERSION)}' "
+        f"ON MATCH SET s.version = '{_cyq(VERSION)}';"
+    )
+
+    # --- modules injectes ---
+    mods = sorted(gen_info.get('used_mods', set()))
+    if mods:
+        lines.append('')
+        lines.append('// --- Organes specialises (modules injectes dynamiquement) ---')
+        for mod in mods:
+            m_id = 'mod_' + _cyident(mod)
+            lines.append(
+                f"MERGE (s:Script {{name: '{_cyq(source_name)}'}})"
+                f"-[:REQUIRES_METABOLISM {{condition: 'Dynamic Detection'}}]->"
+                f"(m:Module {{name: '{_cyq(mod)}'}}) "
+                f"ON CREATE SET m.type = 'Organ', m.injected = true;"
+            )
+            # eviter la variable orpheline m_id (non utilisee), garder la lisibilite
+
+    # --- fonctions + appels par fonction ---
+    funcs = [s for s in ast if s[0] == 'func']
+    rest = [s for s in ast if s[0] != 'func']
+
+    if funcs:
+        lines.append('')
+        lines.append('// --- Expressions genetiques (fonctions) ---')
+        for f in funcs:
+            fname = f[1]
+            label = 'Enzyme' if fname.startswith('_') else 'Expression'
+            lines.append(
+                f"MERGE (s:Script {{name: '{_cyq(source_name)}'}})"
+                f"-[:EXPRESSES]->(f:Function {{name: '{_cyq(fname)}'}}) "
+                f"ON CREATE SET f.type = '{label}', f.arity = {len(f[2])};"
+            )
+
+    # --- appels : top-level et par fonction ---
+    lines.append('')
+    lines.append('// --- Voies metaboliques (appels) ---')
+    pairs = []  # (caller, callee)
+
+    # top-level : les appels hors fonction appartiennent au script
+    top_syms = set()
+    for st in rest:
+        top_syms |= _called_symbols(st)
+    for sym in top_syms:
+        pairs.append(('__script__', sym))
+
+    # par fonction
+    for f in funcs:
+        fname = f[1]
+        for sym in _called_symbols(f[3]):
+            pairs.append((fname, sym))
+
+    # dedup + emit
+    seen = set()
+    for caller, callee in pairs:
+        key = (caller, callee)
+        if key in seen:
+            continue
+        seen.add(key)
+        risk = _risk_of(callee)
+        mod = _module_of(callee)
+        b_id = 'sym_' + _cyident(callee)
+        if caller == '__script__':
+            lines.append(
+                f"MERGE (s:Script {{name: '{_cyq(source_name)}'}})"
+                f"-[:CALLS {{frequency: 1, risk: '{risk}', module: '{_cyq(mod)}'}}]->"
+                f"(b:Builtin {{name: '{_cyq(callee)}'}}) "
+                f"ON CREATE SET b.module = '{_cyq(mod)}';"
+            )
+        else:
+            lines.append(
+                f"MERGE (f:Function {{name: '{_cyq(caller)}'}})"
+                f"-[r:CALLS]->(b:Builtin {{name: '{_cyq(callee)}'}}) "
+                f"ON CREATE SET r.frequency = 1, r.risk = '{risk}', r.module = '{_cyq(mod)}' "
+                f"ON MATCH SET r.frequency = r.frequency + 1;"
+            )
+
+    # --- variables locales (metabolites) ---
+    lines.append('')
+    lines.append('// --- Metabolites (variables locales) ---')
+    var_pairs = []  # (caller, var)
+    for st in rest:
+        for name, _expr in _local_bindings(st, None):
+            var_pairs.append(('__script__', name))
+    for f in funcs:
+        for name, _expr in _local_bindings(f[3], None):
+            var_pairs.append((f[1], name))
+
+    seen_v = set()
+    for caller, var in var_pairs:
+        key = (caller, var)
+        if key in seen_v:
+            continue
+        seen_v.add(key)
+        if caller == '__script__':
+            lines.append(
+                f"MERGE (s:Script {{name: '{_cyq(source_name)}'}})"
+                f"-[:BINDS]->(v:Variable {{name: '{_cyq(var)}'}});"
+            )
+        else:
+            lines.append(
+                f"MERGE (f:Function {{name: '{_cyq(caller)}'}})"
+                f"-[:BINDS]->(v:Variable {{name: '{_cyq(var)}'}});"
+            )
+
+    # --- note finale ---
+    lines.append('')
+    lines.append('// --- Fin du graphe ---')
+    lines.append('// Astuce : MATCH (s:Script) RETURN s; pour voir le noeud racine')
+    lines.append('//        MATCH (f:Function)-[:CALLS]->(b:Builtin {risk: \'high\'}) RETURN f, b;')
+    lines.append('//        pour identifier les fonctions qui font des choses risquées.')
+
+    return '\n'.join(lines) + '\n'
+
+
+# ----------------------------------------------------------------------------
+# Pipeline de transpilation
+# ----------------------------------------------------------------------------
 def extract_lua(text):
-    """Si le fichier est une cartouche .p8, ne garde que la section __lua__."""
     m = re.search(r'^__lua__\s*$', text, re.M)
     if not m:
         return text
@@ -2349,8 +2547,7 @@ def extract_lua(text):
 
 
 def assemble_output(gen, body):
-    """Assemble le .ps1 final. Toujours un param([switch]$DryRun)."""
-    parts = ['# Genere par pico2ps v3.0 - ne pas editer a la main\n']
+    parts = [f'# Genere par pico2ps v3.1 - ne pas editer a la main\n']
     parts.append('[CmdletBinding()]\nparam([switch]$DryRun)\n')
     parts.append(RUNTIME)
     mods = [m for m in SYS_MODULES if m != 'core' and m in gen.used_mods]
@@ -2366,9 +2563,12 @@ def transpile(src, loop=False):
     gen = Gen(ast)
     body = gen.generate(loop)
     out, mods = assemble_output(gen, body)
-    return out, gen.warnings, set(mods), gen.used_syms
+    return out, gen.warnings, set(mods), gen.used_syms, ast, gen
 
 
+# ----------------------------------------------------------------------------
+# main()
+# ----------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(
         description=f'pico2ps {VERSION} — Transpile PICO-8 (Lua) vers PowerShell')
@@ -2385,6 +2585,10 @@ def main():
                     help='affiche les statistiques AST')
     ap.add_argument('--check', action='store_true',
                     help='parse sans ecrire de fichier')
+    ap.add_argument('--graph', action='store_true',
+                    help='genere aussi un script Cypher Neo4j (.cypher)')
+    ap.add_argument('--graph-only', action='store_true',
+                    help='genere uniquement le .cypher (pas de .ps1)')
     ap.add_argument('--no-progress', action='store_true',
                     help='desactive la barre de progression')
     a = ap.parse_args()
@@ -2409,7 +2613,7 @@ def main():
     progress = not a.no_progress
     if progress:
         banner()
-    T = 5
+    T = 6 if (a.graph or a.graph_only) else 5
 
     try:
         with open(a.input, encoding='utf-8') as f:
@@ -2431,7 +2635,6 @@ def main():
             st = ast_stats(ast)
             note('AST : ' + ', '.join(f'{k}×{v}' for k, v in sorted(st.items())))
 
-        # --- alerte services sensibles (toutes chaines litterales) ---
         sens = check_sensitive_services(ast)
         for s in sens:
             caution(f'service sensible cible : {s} ({SENSITIVE_SERVICES[s]})')
@@ -2459,10 +2662,28 @@ def main():
             note('check OK (aucun fichier écrit)')
             return
 
-        path = a.output or re.sub(r'\.[^.]+$', '', a.input) + '.ps1'
-        with open(path, 'w', encoding='utf-8-sig', newline='\r\n') as f:
-            f.write(out)
-        note(f'→ {path}')
+        base = re.sub(r'\.[^.]+$', '', a.input)
+        ps_path = a.output or (base + '.ps1')
+        cypher_path = base + '.cypher'
+
+        if not a.graph_only:
+            with open(ps_path, 'w', encoding='utf-8-sig', newline='\r\n') as f:
+                f.write(out)
+            note(f'→ {ps_path}')
+
+        if a.graph or a.graph_only:
+            if progress:
+                phase(6, T, 'cartographie Neo4j')
+            gen_info = {
+                'used_mods': gen.used_mods,
+                'used_syms': gen.used_syms,
+                'funcs': gen.funcs,
+                'varnames': gen.varnames,
+            }
+            cypher = generate_cypher(ast, gen_info, os.path.basename(a.input))
+            with open(cypher_path, 'w', encoding='utf-8') as f:
+                f.write(cypher)
+            note(f'→ {cypher_path}  (à importer dans Neo4j Browser)')
 
     except TranspileError as e:
         hush(e.render(src_lines if 'src_lines' in locals() else None))
