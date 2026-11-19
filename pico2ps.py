@@ -2,10 +2,13 @@
 """
 pico2ps - transpileur d'un sous-ensemble de PICO-8 (Lua) vers PowerShell.
 
-Version 2.2 :
-  - concatenation .. aplatie en une seule expression (lisibilite)
-  - _mathx_noise : hash sorti du scriptblock, deterministe et plus rapide
-  - _crypto_rng : rejection sampling (tirage uniforme au bit pres)
+Version 2.3 :
+  - builtins systeme accessibles avec ou sans prefixe underscore
+    (svc_stop(...) et _svc_stop(...) produisent tous deux (_svc_stop ...))
+  - param([switch]$DryRun) toujours emis : le .ps1 est toujours testable
+  - avertissement informatif si le script cible un service Windows sensible
+  - concatenation .. aplatie (v2.2), mathx_noise sans closure (v2.2),
+    crypto_rng sans biais par rejection sampling (v2.2)
 
 Usage :
     python pico2ps.py jeu.p8            -> jeu.ps1
@@ -15,28 +18,6 @@ Usage :
     python pico2ps.py jeu.p8 --check    -> parse sans ecrire
     python pico2ps.py --list-modules    -> modules disponibles
     python pico2ps.py --api             -> fonctions systeme detaillees
-
-Sous-ensemble supporte :
-  * variables locales/globales, nombres (dec, 0x, 0b), chaines, true/false/nil
-  * + - * / \\ % ^ .. == ~= != < <= > >= and or not # & | ^^ << >> ~
-  * += -= *= /= \\= %= ^= ..= |= &=   et affectations multiples (a,b = b,a)
-  * if/elseif/else/end, forme courte  if (cond) instruction
-  * while, repeat/until, for i=a,b[,pas], for v in all(t), for k,v in pairs(t), break
-  * function nom(params) ... end, local function, return (une seule valeur)
-  * tables {1,2,3}, {x=1,y=2}, t[i] (indexe a partir de 1), t.x, #t
-  * builtins : flr ceil abs sqrt min max mid sgn rnd srand sin cos atan2 sub tostr
-             tonum chr ord split add del deli count all pairs foreach print printh
-             cls time t flip
-  * bibliotheque systeme :
-      crypto_hash crypto_hmac crypto_rng crypto_uuid crypto_seal crypto_open
-      mathx_clamp mathx_lerp mathx_smooth mathx_map mathx_dist mathx_noise
-      fs_* fichiers   reg_* registre   net_* reseau   task_* planificateur
-      disk_* disques  proc_* processus svc_* services  upd_* mises a jour
-      sys_* systeme   serial_* / usb_* materiel   json_* / str_* utilitaires
-    Les modules utilises sont injectes dans le .ps1 ; les fonctions destructrices
-    respectent le commutateur  -DryRun  du script genere (simulation sans effet).
-Limites connues : pas de closures/fonctions anonymes, pas de methodes (a:b()),
-pas de goto, pas de retours multiples ; `a or b` renvoie un booleen (pas la valeur).
 """
 import argparse
 import os
@@ -119,7 +100,7 @@ def hush(msg):
 
 
 # ----------------------------------------------------------------------------
-# Erreur de transpilation (avec contexte exploitable par l'affichage)
+# Erreur de transpilation
 # ----------------------------------------------------------------------------
 class TranspileError(Exception):
     def __init__(self, msg, line=None, col=None):
@@ -583,7 +564,7 @@ class Parser:
 
 
 # ----------------------------------------------------------------------------
-# Runtime PowerShell (injecte en tete du script genere)
+# Runtime PowerShell
 # ----------------------------------------------------------------------------
 RUNTIME = r'''# --- Runtime pico2ps -------------------------------------------------------
 $script:_t0 = [DateTime]::UtcNow
@@ -769,7 +750,6 @@ function _list($items) {
 }
 '''
 
-# --- crypto (inchange hors _crypto_rng, voir plus bas) ---
 SYS_MODULES['crypto'] = r'''
 # --- crypto : integrite, alea cryptographique, coffre-fort -----------------
 function _crypto_hash($s, $algo = 'SHA256') {
@@ -788,7 +768,7 @@ function _crypto_hmac($s, $key, $algo = 'SHA256') {
     } catch { _warn $_; return $null }
 }
 function _crypto_rng($a = 0, $b = 1) {
-    # Rejection sampling : tirage uniforme au bit pres (pas de biais modulo).
+    # Rejection sampling : tirage uniforme au bit pres.
     if (_dry 'crypto_rng') { return [int64]$a }
     $lo = [int64]$a; $hi = [int64]$b
     if ($hi -lt $lo) { $tmp = $lo; $lo = $hi; $hi = $tmp }
@@ -835,7 +815,6 @@ function _crypto_open($b64, $keyString) {
 }
 '''
 
-# --- mathx (noise refondu : _mhash sorti du scriptblock) ---
 SYS_MODULES['mathx'] = r'''
 # --- mathx : geometrie douce, interpolation, bruit organique ---------------
 function _mathx_clamp($v, $lo, $hi) {
@@ -1678,16 +1657,92 @@ function _str_hash($s, $algo = 'SHA256') {
 '''
 
 
+# --- PATCH v2.3 : double cle (avec et sans underscore) ---
 def _sys_builtins():
     out = {}
     for mod, code in SYS_MODULES.items():
         for m in re.finditer(r'^function _(' + mod + r'_\w+)', code, re.M):
-            out[m.group(1)] = '_' + m.group(1)
+            name = m.group(1)                      # ex: 'svc_stop'
+            out[name] = '_' + name                 # 'svc_stop'  -> _svc_stop
+            out['_' + name] = '_' + name           # '_svc_stop' -> _svc_stop
     return out
 
 
 SYS_BUILTINS = _sys_builtins()
 BUILTINS.update(SYS_BUILTINS)
+
+
+# --- PATCH v2.3 : services sensibles signales a titre informatif ---
+SENSITIVE_SERVICES = {
+    'wuauserv': 'Windows Update (protégé par WaaSMedic depuis Win10 1809)',
+    'waasmedicsvc': 'Windows Update Medic (protection du service WU)',
+    'windefend': 'Windows Defender',
+    'bits': 'Background Intelligent Transfer Service',
+    'trustedinstaller': 'Windows Modules Installer',
+    'msiserver': 'Windows Installer',
+    'eventlog': 'Journal d\'événements Windows',
+    'rpcss': 'RPC (dépendance critique)',
+    'dnscache': 'Client DNS',
+    'lanmanserver': 'Serveur (partages réseau)',
+    'lanmanworkstation': 'Station de travail (accès réseau)',
+    'schedule': 'Planificateur de tâches',
+    'winmgmt': 'Instrumentation de gestion Windows (WMI)',
+}
+
+
+def check_sensitive_services(ast):
+    """Retourne la liste des services sensibles ciblés par le script Lua."""
+    found = set()
+    for node in ast:
+        for sub in walk_iter(node):
+            if sub[0] == 'local':
+                for expr in sub[2]:
+                    for s in _strings_in(expr):
+                        if s.lower() in SENSITIVE_SERVICES:
+                            found.add(s.lower())
+            elif sub[0] == 'assign':
+                for expr in sub[2]:
+                    for s in _strings_in(expr):
+                        if s.lower() in SENSITIVE_SERVICES:
+                            found.add(s.lower())
+            elif sub[0] == 'call':
+                for arg in sub[2]:
+                    for s in _strings_in(arg):
+                        if s.lower() in SENSITIVE_SERVICES:
+                            found.add(s.lower())
+    return sorted(found)
+
+
+def walk_iter(node):
+    """Iterateur simple sur un sous-arbre AST."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        yield n
+        if not isinstance(n, tuple):
+            continue
+        for x in n:
+            if isinstance(x, tuple):
+                stack.append(x)
+            elif isinstance(x, list):
+                for y in x:
+                    if isinstance(y, tuple):
+                        stack.append(y)
+
+
+def _strings_in(expr):
+    out = []
+    if not isinstance(expr, tuple):
+        return out
+    if expr[0] == 'str':
+        out.append(expr[1])
+    for x in expr:
+        if isinstance(x, tuple):
+            out.extend(_strings_in(x))
+        elif isinstance(x, list):
+            for y in x:
+                out.extend(_strings_in(y))
+    return out
 
 
 def api_listing():
@@ -1796,7 +1851,7 @@ class Gen:
 
     def use(self, n):
         if n in SYS_BUILTINS:
-            self.used_mods.add(n.split('_')[0])
+            self.used_mods.add(SYS_BUILTINS[n].lstrip('_').split('_')[0])
             self.used_syms.add(n)
 
     def new_tmp(self):
@@ -1830,9 +1885,7 @@ class Gen:
     def paren(c):
         return c if c.startswith('(') else f'({c})'
 
-    # --- PATCH 1 : concatenation .. aplatie en une seule expression ---
     def _flatten_concat(self, e, parts):
-        """Recolte les operandes d'une chaine gauche-associative de '..'."""
         if e[0] == 'bin' and e[1] == '..':
             self._flatten_concat(e[2], parts)
             self._flatten_concat(e[3], parts)
@@ -2119,25 +2172,30 @@ def extract_lua(text):
     return rest[:m2.start()] if m2 else rest
 
 
-def transpile(src, loop=False):
-    ast = Parser(lex(extract_lua(src))).parse_chunk()
-    gen = Gen(ast)
-    body = gen.generate(loop)
+def assemble_output(gen, body):
+    """Assemble le .ps1 final. Toujours un param([switch]$DryRun)."""
     parts = ['# Genere par pico2ps - ne pas editer a la main\n']
-    mods = [m for m in SYS_MODULES if m != 'core' and m in gen.used_mods]
-    if mods:
-        parts.append('[CmdletBinding()]\nparam([switch]$DryRun)\n')
+    parts.append('[CmdletBinding()]\nparam([switch]$DryRun)\n')
     parts.append(RUNTIME)
+    mods = [m for m in SYS_MODULES if m != 'core' and m in gen.used_mods]
     if mods:
         parts.append(SYS_MODULES['core'])
         parts.extend(SYS_MODULES[m] for m in mods)
     parts.append('\n' + body)
-    return ''.join(parts), gen.warnings, gen.used_mods, gen.used_syms
+    return ''.join(parts), mods
+
+
+def transpile(src, loop=False):
+    ast = Parser(lex(extract_lua(src))).parse_chunk()
+    gen = Gen(ast)
+    body = gen.generate(loop)
+    out, mods = assemble_output(gen, body)
+    return out, gen.warnings, set(mods), gen.used_syms
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description='Transpile PICO-8 (Lua) vers PowerShell (v2.2 Vivant)')
+        description='Transpile PICO-8 (Lua) vers PowerShell (v2.3 Vivant)')
     ap.add_argument('input', nargs='?')
     ap.add_argument('--api', action='store_true',
                     help='liste les fonctions systeme disponibles')
@@ -2196,6 +2254,13 @@ def main():
             st = ast_stats(ast)
             note('AST : ' + ', '.join(f'{k}×{v}' for k, v in sorted(st.items())))
 
+        # --- v2.3 : alerte services sensibles ---
+        sens = check_sensitive_services(ast)
+        for s in sens:
+            caution(f'service sensible cible : {s} ({SENSITIVE_SERVICES[s]})')
+        if sens:
+            caution('verifie deux fois avant execution reelle ; utilise -DryRun pour simuler')
+
         if progress:
             phase(4, T, 'transpilation')
         gen = Gen(ast)
@@ -2203,16 +2268,7 @@ def main():
 
         if progress:
             phase(5, T, 'assemblage des modules')
-        parts = ['# Genere par pico2ps - ne pas editer a la main\n']
-        mods = [m for m in SYS_MODULES if m != 'core' and m in gen.used_mods]
-        if mods:
-            parts.append('[CmdletBinding()]\nparam([switch]$DryRun)\n')
-        parts.append(RUNTIME)
-        if mods:
-            parts.append(SYS_MODULES['core'])
-            parts.extend(SYS_MODULES[m] for m in mods)
-        parts.append('\n' + body)
-        out = ''.join(parts)
+        out, mods = assemble_output(gen, body)
 
         for w in gen.warnings:
             caution(w)
