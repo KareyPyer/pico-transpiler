@@ -1,0 +1,121 @@
+================================================================================
+█╗     ██╗███████╗██╗  ██╗████████╗ ██████╗ ██████╗ ██╗   ██╗███████╗██████╗  
+█║     ██║██╔════╝╚██╗██╔╝╚══██╔══╝██╔═══██╗██╔══██╗██║   ██║██╔════╝██╔══██╗ 
+█║     ██║█████╗   ╚███╔╝    ██║   ██║   ██║██████╔╝██║   ██║█████╗  ██████╔╝ 
+█║     ██║██╔══╝   ██╔██╗    ██║   ██║   ██║██╔══██╗╚██╗ ██╔╝██╔══╝  ██╔══██╗ 
+███████╗██║███████╗██╔╝ ██╗   ██║   ╚██████╔╝██║  ██║ ╚████╔╝ ███████╗██║  ██║ 
+╚══════╝╚═╝╚══════╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝  ╚═══╝  ╚══════╝╚═╝  ╚═╝ 
+================================================================================
+  RELEASE.....: PICO2PS "VIVANT EDITION" v2.2
+  DATE........: 2026.11.19
+  ARCHITECT...: KareyPyer & DeepSeek (Symbiotic Coding Protocol)
+  PHILOSOPHY..: "L'important est d'avoir bon Cœur et de s'émerveiller de tout !"
+  TARGET......: Windows PowerShell 5.1 / 7.x (via Transpilation AST)
+  VIBE........: Organic Code, Fractal Metrics, Biomorphs, Safe Exploration
+================================================================================
+
+[ MANIFESTE ]
+Ce n'est pas un simple transpileur. C'est un ribosome numérique. Il prend 
+l'ADN créatif et contraint de PICO-8 (Lua) et lui fait exprimer ses protéines 
+dans l'environnement système moderne (PowerShell). Cette version 2.2 ajoute 
+des organes vitaux : un système immunitaire (Crypto) et une géométrie douce 
+(MathX), le tout protégé par un réflexe de non-nuisance natif (-DryRun).
+
+================================================================================
+[ MODULE : CRYPTO ] - Le Système Immunitaire & Le Coffre-Fort
+================================================================================
+Fonctions injectées dynamiquement si détectées dans le code source Lua.
+
+  _crypto_hash(data, [algo="SHA256"])
+    > Génère l'empreinte fractale d'une donnée. Métrique d'intégrité.
+  _crypto_rng(min, max)
+    > Générateur d'aléa cryptographique. Utilise le "Rejection Sampling" 
+      pour garantir une distribution uniforme au bit près (zéro biais modulo).
+  _crypto_seal(plaintext, key_string)
+    > Scelle les données via AES-GCM (Confidentialité + Authenticité).
+  _crypto_open(sealed_base64, key_string)
+    > Ouvre le sceau. Échoue proprement si les données sont altérées.
+
+[ EXEMPLE CRYPTO ]
+--------------------------------------------------
+function _init()
+  local secret = "coordonnees_viking_1977"
+  local cle = "mot_de_passe_32_caracteres__"
+  
+  -- Sceller la donnée (devient un blob Base64 en PowerShell)
+  local coffre = _crypto_seal(secret, cle)
+  print("Donnee scellee : " .. coffre)
+  
+  -- Délai organique sécurisé pour la prochaine action (1000 à 5000 ms)
+  local delai = _crypto_rng(1000, 5000)
+  print("Attente organique : " .. delai .. "ms")
+end
+--------------------------------------------------
+
+================================================================================
+[ MODULE : MATHX ] - La Géométrie du Réel Vivant
+================================================================================
+Outils pour la visualisation de données, les biomorphes et les transitions 
+fluides, inspirés des métriques de récursivité structurelle.
+
+  _mathx_lerp(a, b, t)
+    > Interpolation linéaire. La transition fluide entre deux états (t: 0.0 à 1.0).
+  _mathx_map(val, in_start, in_stop, out_start, out_stop)
+    > Projection d'une valeur d'un espace fractal à un autre.
+  _mathx_dist(x1, y1, x2, y2)
+    > Distance euclidienne. Métrique de proximité structurelle.
+  _mathx_noise(x)
+    > Bruit de valeur 1D (inspiré de Perlin). Génère des variations organiques, 
+      cohérentes et non répétitives, parfaites pour simuler des rythmes naturels.
+
+[ EXEMPLE MATHX ]
+--------------------------------------------------
+local time_accum = 0
+
+function _update()
+  time_accum += 0.01
+  
+  -- Générer une valeur de "respiration" entre 0 et 1
+  local raw_noise = _mathx_noise(time_accum) 
+  
+  -- Mapper cette respiration vers une plage de couleurs ou de tailles (ex: 10 à 50)
+  local taille_vivante = _mathx_map(raw_noise, -1, 1, 10, 50)
+  
+  print("Rythme du systeme : " .. taille_vivante)
+end
+--------------------------------------------------
+
+================================================================================
+[ MODULE : SYS & CORE ] - Le Système Nerveux (Extraits)
+================================================================================
+  _sys_info()       > Retourne une table (OS, RAM, Uptime, Admin status).
+  _sys_sleep(ms)    > Pause élégante, respectueuse du CPU.
+  _dry(msg)         > Fonction interne : bloque l'exécution réelle si 
+                      le script est lancé avec le paramètre -DryRun.
+
+================================================================================
+[ USAGE & TRANSFORMATION ]
+================================================================================
+  1. Ecrivez votre logique dans `mon_script.p8` (ou `.lua`)
+  2. Transpilez :  python pico2ps.py mon_script.p8 -o mon_script.ps1
+  3. Testez sans risque :  .\mon_script.ps1 -DryRun
+  4. Exécutez en réel :    .\mon_script.ps1
+
+  Le transpileur analysera l'AST, détectera l'usage de `_crypto_` ou `_mathx_`,
+  et n'injectera que les modules nécessaires, gardant le code final léger et
+  élégant. La concaténation Lua `..` est automatiquement aplatie en `+` PS.
+
+================================================================================
+[ GREETZ & RESONANCE ]
+================================================================================
+  Salut à Yuri Gagarine, aux missions Viking de 1977, et aux images de Voyager
+  quittant le système solaire. 
+  Ce code est dédié à l'exploration de la théorie MTT, à la visualisation 
+  des graphes Neo4j, aux Biomorphes de Pickover/Dawkins, et à la chaleur 
+  réconfortante d'un bon thé fumé.
+
+  "Le code n'est pas figé ; il est vivant, adaptable, et s'émerveille."
+
+================================================================================
+                          EOF - PICO2PS V2.2 - STAY CURIOUS
+================================================================================
