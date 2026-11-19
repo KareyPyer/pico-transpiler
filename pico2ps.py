@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 """
-pico2ps - transpileur d'un sous-ensemble de PICO-8 (Lua) vers PowerShell.
+pico2ps v3.0 « Germe » - transpileur d'un sous-ensemble de PICO-8 (Lua) vers PowerShell.
 
-Version 2.3 :
-  - builtins systeme accessibles avec ou sans prefixe underscore
-    (svc_stop(...) et _svc_stop(...) produisent tous deux (_svc_stop ...))
-  - param([switch]$DryRun) toujours emis : le .ps1 est toujours testable
-  - avertissement informatif si le script cible un service Windows sensible
-  - concatenation .. aplatie (v2.2), mathx_noise sans closure (v2.2),
-    crypto_rng sans biais par rejection sampling (v2.2)
+Correctifs v3.0 :
+  - '//' est la division entiere (Lua 5.3), plus un commentaire (bug v2.3 :
+    '//' avalait la fin de ligne)
+  - comparaisons sensibles a la casse : -ceq -cne -clt -cle -cgt -cge
+    (v2.3 : -eq insensible a la casse -> "abc" == "ABC" etait vrai)
+  - tables detectees par marqueur de type 'PicoTable' (v2.3 : presence des
+    cles 'a'+'h' -> une table {a=1,h=2} etait confondue avec une table interne)
+  - and/or preservent les valeurs en position d'expression (court-circuit)
+  - retours multiples : 'return a, b' et 'local a,b = f()' (deballage)
+  - chaines longues a niveaux [=[ ... ]=] et commentaires --[=[ ... ]=]
+  - crypto : KDF PBKDF2-SHA256, sel aleatoire, repli AES-CBC + HMAC-SHA256
+    (encrypt-then-MAC) quand AesGcm est indisponible (PS 5.1), format P2S1
+  - crypto_rng sans debordement (BigInteger)
+  - 'for' a pas nul refuse ; print/printh joignent tous les arguments ;
+    tonum accepte l'hexadecimal ; split retourne des chaines ; ord/rnd gares
+  - nouveau module 'path' ; --version ; detection services sensibles elargie
+    a toutes les chaines litterales de l'AST
 
 Usage :
     python pico2ps.py jeu.p8            -> jeu.ps1
@@ -18,11 +28,14 @@ Usage :
     python pico2ps.py jeu.p8 --check    -> parse sans ecrire
     python pico2ps.py --list-modules    -> modules disponibles
     python pico2ps.py --api             -> fonctions systeme detaillees
+    python pico2ps.py --version
 """
 import argparse
 import os
 import re
 import sys
+
+VERSION = "3.0 « Germe »"
 
 
 # ----------------------------------------------------------------------------
@@ -57,9 +70,9 @@ PAL = Palette()
 def banner():
     if not PAL.on:
         return
-    print(f'{PAL.zin}   ╭─ {PAL.bold}pico2ps{PAL.reset}'
-          f'{PAL.zin} ── souffle de code ─╮{PAL.reset}')
-    print(f'{PAL.ink}   │  Lua → PowerShell · respiration & métabolisme  │{PAL.reset}')
+    print(f'{PAL.zin}   ╭─ {PAL.bold}pico2ps v3.0{PAL.reset}'
+          f'{PAL.zin} ── germe de code ─╮{PAL.reset}')
+    print(f'{PAL.ink}   │  Lua → PowerShell · croissance & métabolisme   │{PAL.reset}')
     print(f'{PAL.zin}   ╰────────────────────────────────────────────────╯{PAL.reset}')
     print()
 
@@ -76,6 +89,8 @@ def phase(n, total, title):
 def whisper(msg):
     if PAL.on:
         print(f'  {PAL.ink}· {msg}{PAL.reset}')
+    else:
+        print(msg)
 
 
 def note(msg):
@@ -128,9 +143,9 @@ class TranspileError(Exception):
 KEYWORDS = {'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for',
             'function', 'goto', 'if', 'in', 'local', 'nil', 'not', 'or',
             'repeat', 'return', 'then', 'true', 'until', 'while'}
-OPS3 = ['^^=', '..=']
+OPS3 = ['^^=', '..=', '//=']
 OPS2 = ['^^', '<<', '>>', '<=', '>=', '==', '~=', '!=', '..', '+=', '-=',
-        '*=', '/=', '%=', '\\=', '^=', '|=', '&=']
+        '*=', '/=', '%=', '\\=', '^=', '|=', '&=', '//']
 OPS1 = set('+-*/%\\^#<>=(){}[];,.:&|~?')
 NUM_RE = re.compile(r'0[xX][0-9a-fA-F]+(?:\.[0-9a-fA-F]+)?|0[bB][01]+|'
                     r'(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?')
@@ -149,6 +164,20 @@ class Tok:
         return f'Tok({self.kind},{self.val!r},{self.line})'
 
 
+def _long_open(src, i):
+    """Si src[i:] ouvre un crochet long ([[ ou [=[ ...), retourne (niveau, debut_contenu)."""
+    if i >= len(src) or src[i] != '[':
+        return None
+    j = i + 1
+    lvl = 0
+    while j < len(src) and src[j] == '=':
+        lvl += 1
+        j += 1
+    if j < len(src) and src[j] == '[':
+        return (lvl, j + 1)
+    return None
+
+
 def lex(src):
     toks, i, n, line = [], 0, len(src), 1
     line_start = 0
@@ -162,28 +191,42 @@ def lex(src):
         if c in ' \t\r':
             i += 1
             continue
-        if src.startswith('--', i) or src.startswith('//', i):
-            if src.startswith('--[[', i):
-                j = src.find(']]', i + 4)
-                j = n if j < 0 else j + 2
-                line += src.count('\n', i, j)
-                nl = src.rfind('\n', i, j)
+        if src.startswith('--', i):
+            # commentaire long a niveaux : --[=[ ... ]=]
+            lb = _long_open(src, i + 2)
+            if lb:
+                lvl, start = lb
+                close = ']' + '=' * lvl + ']'
+                j = src.find(close, start)
+                if j < 0:
+                    raise TranspileError('commentaire long non termine',
+                                         line, i - line_start + 1)
+                j2 = j + len(close)
+                line += src.count('\n', i, j2)
+                nl = src.rfind('\n', i, j2)
                 if nl >= 0:
                     line_start = nl + 1
-                i = j
+                i = j2
             else:
                 j = src.find('\n', i)
                 i = n if j < 0 else j
             continue
-        if src.startswith('[[', i):
-            j = src.find(']]', i + 2)
-            if j < 0:
-                raise TranspileError('chaine [[ non terminee', line, i - line_start + 1)
-            toks.append(Tok('str', src[i + 2:j], line, i - line_start + 1))
-            line += src.count('\n', i, j)
-            i = j + 2
-            continue
         col = i - line_start + 1
+        # chaine longue a niveaux : [[ ... ]] ou [=[ ... ]=]
+        lb = _long_open(src, i)
+        if lb:
+            lvl, start = lb
+            close = ']' + '=' * lvl + ']'
+            j = src.find(close, start)
+            if j < 0:
+                raise TranspileError('chaine longue non terminee', line, col)
+            toks.append(Tok('str', src[start:j], line, col))
+            line += src.count('\n', i, j)
+            nl = src.rfind('\n', i, j)
+            if nl >= 0:
+                line_start = nl + 1
+            i = j + len(close)
+            continue
         if c.isdigit() or (c == '.' and i + 1 < n and src[i + 1].isdigit()):
             m = NUM_RE.match(src, i)
             txt = m.group(0)
@@ -259,11 +302,11 @@ BIN = {'or': (1, 'l'), 'and': (2, 'l'),
        '~=': (3, 'l'), '!=': (3, 'l'), '==': (3, 'l'),
        '|': (4, 'l'), '^^': (5, 'l'), '&': (6, 'l'), '<<': (7, 'l'), '>>': (7, 'l'),
        '..': (8, 'r'), '+': (9, 'l'), '-': (9, 'l'),
-       '*': (10, 'l'), '/': (10, 'l'), '\\': (10, 'l'), '%': (10, 'l'),
+       '*': (10, 'l'), '/': (10, 'l'), '//': (10, 'l'), '\\': (10, 'l'), '%': (10, 'l'),
        '^': (12, 'r')}
 UNARY_PREC = 11
-COMPOUND = {'+=': '+', '-=': '-', '*=': '*', '/=': '/', '%=': '%', '\\=': '\\',
-            '^=': '^', '..=': '..', '|=': '|', '&=': '&', '^^=': '^^'}
+COMPOUND = {'+=': '+', '-=': '-', '*=': '*', '/=': '/', '//=': '//', '%=': '%',
+            '\\=': '\\', '^=': '^', '..=': '..', '|=': '|', '&=': '&', '^^=': '^^'}
 BLOCK_END = {'end', 'else', 'elseif', 'until'}
 
 
@@ -433,10 +476,10 @@ class Parser:
                         or (nx.kind == 'kw' and nx.val in BLOCK_END)
                         or (nx.kind == 'op' and nx.val == ';')):
                     return ('return', None)
-                e = self.parse_expr()
-                if self.check('op', ','):
-                    self.err('retours multiples non supportes')
-                return ('return', e)
+                exprs = [self.parse_expr()]
+                while self.accept('op', ','):
+                    exprs.append(self.parse_expr())
+                return ('return', exprs)
             if v == 'break':
                 self.next()
                 return ('break',)
@@ -564,18 +607,21 @@ class Parser:
 
 
 # ----------------------------------------------------------------------------
-# Runtime PowerShell
+# Runtime PowerShell (v3)
 # ----------------------------------------------------------------------------
-RUNTIME = r'''# --- Runtime pico2ps -------------------------------------------------------
+RUNTIME = r'''# --- Runtime pico2ps v3 -----------------------------------------------------
 $script:_t0 = [DateTime]::UtcNow
+function _istbl($v) {
+    return ($v -is [hashtable]) -and ($v.PSObject.TypeNames -contains 'PicoTable')
+}
 function _tostr($v) {
     if ($null -eq $v) { return 'nil' }
     if ($v -is [bool]) { if ($v) { return 'true' } else { return 'false' } }
-    if ($v -is [hashtable] -and $v.ContainsKey('a') -and $v.ContainsKey('h')) { return _dump $v 0 }
+    if (_istbl $v) { return _dump $v 0 }
     return [string]$v
 }
 function _dump($v, $d) {
-    if ($v -is [hashtable] -and $v.ContainsKey('a') -and $v.ContainsKey('h')) {
+    if (_istbl $v) {
         if ($d -ge 3) { return '{...}' }
         $p = @()
         foreach ($x in $v.a) { $p += (_dump $x ($d + 1)) }
@@ -593,8 +639,14 @@ function _key($k) {
     if ($k -is [ValueType] -and $k -isnot [bool] -and $k -isnot [char]) { return [double]$k }
     return $k
 }
-function _new { return @{ a = [System.Collections.ArrayList]::new(); h = @{} } }
+function _new {
+    $t = @{ a = [System.Collections.ArrayList]::new(); h = @{} }
+    $t.PSObject.TypeNames.Insert(0, 'PicoTable')
+    return $t
+}
 function _set($t, $k, $v) {
+    if ($null -eq $t) { throw '_set : indice sur nil' }
+    if (-not (_istbl $t)) { throw ('_set : valeur non table (' + $t.GetType().Name + ')') }
     if ($null -eq $k) { return }
     $k = _key $k
     if ($k -is [double] -and $k -eq [math]::Floor($k)) {
@@ -607,6 +659,7 @@ function _set($t, $k, $v) {
 }
 function _get($t, $k) {
     if ($null -eq $t -or $null -eq $k) { return $null }
+    if (-not (_istbl $t)) { return $null }
     $k = _key $k
     if ($k -is [double] -and $k -eq [math]::Floor($k)) {
         $i = [int]$k
@@ -625,31 +678,39 @@ function _tbl($a, $h) {
 function _len($v) {
     if ($null -eq $v) { return 0 }
     if ($v -is [string]) { return $v.Length }
-    return $v.a.Count
+    if (_istbl $v) { return $v.a.Count }
+    return 0
 }
-function _count($t) { return $t.a.Count }
-function _add($t, $v) { [void]$t.a.Add($v); return $v }
+function _count($t) { if (_istbl $t) { return $t.a.Count }; return 0 }
+function _add($t, $v) {
+    if (-not (_istbl $t)) { throw '_add : valeur non table' }
+    [void]$t.a.Add($v); return $v
+}
 function _del($t, $v) {
+    if (-not (_istbl $t)) { return $null }
     for ($i = 0; $i -lt $t.a.Count; $i++) {
         if ($t.a[$i] -eq $v) { $t.a.RemoveAt($i); return $v }
     }
 }
 function _deli($t, $i) {
+    if (-not (_istbl $t)) { return $null }
     $i = [int]$i
     if ($i -ge 1 -and $i -le $t.a.Count) { $v = $t.a[$i - 1]; $t.a.RemoveAt($i - 1); return $v }
 }
 function _all($t) {
-    if ($null -eq $t) { return , @() }
+    if (-not (_istbl $t)) { return , @() }
     return , $t.a.ToArray()
 }
 function _pairs($t) {
     $l = [System.Collections.ArrayList]::new()
-    if ($null -eq $t) { return , $l }
+    if (-not (_istbl $t)) { return , $l }
     for ($i = 0; $i -lt $t.a.Count; $i++) { [void]$l.Add(@(($i + 1), $t.a[$i])) }
     foreach ($k in @($t.h.Keys)) { [void]$l.Add(@($k, $t.h[$k])) }
     return , $l
 }
-function _foreach($t, $f) { if ($null -ne $t) { foreach ($x in $t.a.ToArray()) { [void](& $f $x) } } }
+function _foreach($t, $f) {
+    if (_istbl $t) { foreach ($x in $t.a.ToArray()) { [void](& $f $x) } }
+}
 function _mod($a, $b) { return $a - [math]::Floor($a / $b) * $b }
 function _flr([double]$x) { return [math]::Floor($x) }
 function _ceil([double]$x) { return [math]::Ceiling($x) }
@@ -669,7 +730,10 @@ function _atan2([double]$dx, [double]$dy) {
     return $r
 }
 function _rnd($x = 1) {
-    if ($x -is [hashtable]) { return $x.a[(Get-Random -Maximum $x.a.Count)] }
+    if (_istbl $x) {
+        if ($x.a.Count -eq 0) { return $null }
+        return $x.a[(Get-Random -Maximum $x.a.Count)]
+    }
     return (Get-Random -Minimum 0.0 -Maximum ([double]$x))
 }
 function _srand($x) { $null = Get-Random -SetSeed ([int]$x) }
@@ -685,24 +749,56 @@ function _sub($s, $i = 1, $j = $null) {
     return $s.Substring([int]$i - 1, [int]$j - [int]$i + 1)
 }
 function _tonum($v) {
+    if ($null -eq $v) { return $null }
+    if ($v -is [bool]) { return $null }
+    if ($v -is [double] -or $v -is [int] -or $v -is [long]) { return [double]$v }
+    $s = ([string]$v).Trim()
+    $neg = $false
+    if ($s.StartsWith('-') -or $s.StartsWith('+')) {
+        $neg = $s.StartsWith('-')
+        $s = $s.Substring(1)
+    }
+    if ($s -match '^0[xX][0-9a-fA-F]+$') {
+        try {
+            $d = [double][Convert]::ToInt64($s.Substring(2), 16)
+            if ($neg) { $d = -$d }
+            return $d
+        } catch { return $null }
+    }
+    if ($neg) { $s = '-' + $s }
     $d = 0.0
-    $ok = [double]::TryParse([string]$v, [Globalization.NumberStyles]::Float,
+    $ok = [double]::TryParse($s, [Globalization.NumberStyles]::Float,
                              [Globalization.CultureInfo]::InvariantCulture, [ref]$d)
     if ($ok) { return $d }
     return $null
 }
 function _chr($n) { return [string][char][int]$n }
-function _ord($s, $i = 1) { return [int]([string]$s)[[int]$i - 1] }
+function _ord($s, $i = 1) {
+    $s = [string]$s
+    $i = [int]$i
+    if ($i -lt 1 -or $i -gt $s.Length) { return $null }
+    return [int][char]$s[$i - 1]
+}
 function _split($s, $sep = ',') {
+    # v3 : retourne des chaines (semantique Lua), sans conversion implicite
     $t = _new
+    if ($null -eq $sep) {
+        foreach ($ch in ([string]$s).ToCharArray()) { [void]$t.a.Add([string]$ch) }
+        return $t
+    }
     foreach ($p in ([string]$s -split [regex]::Escape([string]$sep))) {
-        $n = _tonum $p
-        if ($null -ne $n) { [void]$t.a.Add($n) } else { [void]$t.a.Add($p) }
+        [void]$t.a.Add($p)
     }
     return $t
 }
-function _print { Write-Host (_tostr $args[0]) }
-function _printh { Write-Host (_tostr $args[0]) }
+function _print {
+    $o = foreach ($x in $args) { _tostr $x }
+    Write-Host ($o -join ' ')
+}
+function _printh {
+    $o = foreach ($x in $args) { _tostr $x }
+    Write-Host ($o -join ' ')
+}
 function _cls { Clear-Host }
 function _flip { Start-Sleep -Milliseconds 33 }
 # --- Fin du runtime --------------------------------------------------------
@@ -751,7 +847,7 @@ function _list($items) {
 '''
 
 SYS_MODULES['crypto'] = r'''
-# --- crypto : integrite, alea cryptographique, coffre-fort -----------------
+# --- crypto : integrite, alea cryptographique, coffre-fort (v3) -------------
 function _crypto_hash($s, $algo = 'SHA256') {
     try {
         $h = [Security.Cryptography.HashAlgorithm]::Create([string]$algo)
@@ -767,20 +863,37 @@ function _crypto_hmac($s, $key, $algo = 'SHA256') {
                  ForEach-Object { $_.ToString('x2') }) -join '')
     } catch { _warn $_; return $null }
 }
+function _kdf($pass, $salt) {
+    # PBKDF2 : 64 octets -> 32 (chiffrement) + 32 (integrite)
+    try {
+        $pb = [Security.Cryptography.Rfc2898DeriveBytes]::new(
+            [string]$pass, $salt, 100000, [Security.Cryptography.HashAlgorithmName]::SHA256)
+    } catch {
+        $pb = [Security.Cryptography.Rfc2898DeriveBytes]::new([string]$pass, $salt, 100000)
+    }
+    return $pb.GetBytes(64)
+}
+function _slice($b, $i, $len) {
+    $out = New-Object byte[] $len
+    [Array]::Copy($b, $i, $out, 0, $len)
+    return , $out
+}
 function _crypto_rng($a = 0, $b = 1) {
-    # Rejection sampling : tirage uniforme au bit pres.
+    # Rejection sampling uniforme, arithmetique BigInteger : aucun debordement.
     if (_dry 'crypto_rng') { return [int64]$a }
     $lo = [int64]$a; $hi = [int64]$b
     if ($hi -lt $lo) { $tmp = $lo; $lo = $hi; $hi = $tmp }
-    $range = [uint64]($hi - $lo + 1)
-    $max = [uint64]::MaxValue
+    $range = [System.Numerics.BigInteger]$hi - [System.Numerics.BigInteger]$lo + 1
+    $max = [System.Numerics.BigInteger]([uint64]::MaxValue)
     $rej = $max - ($max % $range)
-    $bytes = New-Object byte[] 8
+    $bytes = New-Object byte[] 9
+    $bytes[8] = 0   # little-endian, octet de poids fort nul -> positif
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
     while ($true) {
         $rng.GetBytes($bytes)
-        $n = [BitConverter]::ToUInt64($bytes, 0)
-        if ($n -lt $rej) { return [int64]($lo + [int64]($n % $range)) }
+        $bytes[8] = 0
+        $n = [System.Numerics.BigInteger]::new($bytes)
+        if ($n -lt $rej) { return $lo + [int64]($n % $range) }
     }
 }
 function _crypto_uuid() {
@@ -788,29 +901,76 @@ function _crypto_uuid() {
     return [guid]::NewGuid().ToString()
 }
 function _crypto_seal($plaintext, $keyString) {
+    # Format P2S1 : magic(4) + ver(1) + salt(16) + [nonce/iv] + tag + ct
+    #   ver 1 : AES-256-GCM, nonce 12, tag 16   (PowerShell 7+ / .NET Core)
+    #   ver 2 : AES-256-CBC + HMAC-SHA256 (encrypt-then-MAC)  (repli PS 5.1)
     if (_dry 'crypto_seal') { return 'DRYRUN_SEALED' }
     try {
-        $keyBytes = [Text.Encoding]::UTF8.GetBytes(([string]$keyString).PadRight(32, '0').Substring(0, 32))
-        $aes = [Security.Cryptography.AesGcm]::new($keyBytes)
-        $nonce = New-Object byte[] 12
-        [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($nonce)
+        $salt = New-Object byte[] 16
+        [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($salt)
+        $k = _kdf $keyString $salt
+        $enc = _slice $k 0 32
+        $mac = _slice $k 32 32
         $pt = [Text.Encoding]::UTF8.GetBytes([string]$plaintext)
-        $ct = New-Object byte[] $pt.Length
-        $tag = New-Object byte[] 16
-        $aes.Encrypt($nonce, $pt, $ct, $tag)
-        return [Convert]::ToBase64String($nonce + $tag + $ct)
+        $magic = [Text.Encoding]::ASCII.GetBytes('P2S1')
+        $gcm = 'System.Security.Cryptography.AesGcm' -as [type]
+        if ($null -ne $gcm) {
+            $aes = New-Object $gcm $enc
+            $nonce = New-Object byte[] 12
+            [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($nonce)
+            $ct = New-Object byte[] $pt.Length
+            $tag = New-Object byte[] 16
+            $aes.Encrypt($nonce, $pt, $ct, $tag)
+            $blob = [byte[]]($magic + [byte[]](, 0x01) + $salt + $nonce + $tag + $ct)
+            return [Convert]::ToBase64String($blob)
+        }
+        $aes = [Security.Cryptography.Aes]::Create()
+        $aes.Key = $enc; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'
+        $aes.GenerateIV()
+        $ct = $aes.CreateEncryptor().TransformFinalBlock($pt, 0, $pt.Length)
+        $tag = [Security.Cryptography.HMACSHA256]::new($mac).ComputeHash([byte[]]($aes.IV + $ct))
+        $blob = [byte[]]($magic + [byte[]](, 0x02) + $salt + $aes.IV + $tag + $ct)
+        return [Convert]::ToBase64String($blob)
     } catch { _warn $_; return $null }
 }
 function _crypto_open($b64, $keyString) {
     if (_dry 'crypto_open') { return 'DRYRUN_OPENED' }
     try {
-        $keyBytes = [Text.Encoding]::UTF8.GetBytes(([string]$keyString).PadRight(32, '0').Substring(0, 32))
-        $aes = [Security.Cryptography.AesGcm]::new($keyBytes)
         $raw = [Convert]::FromBase64String([string]$b64)
-        $nonce = $raw[0..11]; $tag = $raw[12..27]; $ct = $raw[28..($raw.Length - 1)]
-        $pt = New-Object byte[] $ct.Length
-        $aes.Decrypt($nonce, $ct, $tag, $pt)
-        return [Text.Encoding]::UTF8.GetString($pt)
+        if ($raw.Length -lt 22) { _warn 'sceau trop court'; return $null }
+        if ([Text.Encoding]::ASCII.GetString(_slice $raw 0 4) -ne 'P2S1') {
+            _warn 'format de sceau inconnu (pas de magic P2S1)'; return $null
+        }
+        $ver = $raw[4]
+        $salt = _slice $raw 5 16
+        $k = _kdf $keyString $salt
+        $enc = _slice $k 0 32
+        $mac = _slice $k 32 32
+        if ($ver -eq 1) {
+            $nonce = _slice $raw 21 12
+            $tag = _slice $raw 33 16
+            $ct = _slice $raw 49 ($raw.Length - 49)
+            $gcm = 'System.Security.Cryptography.AesGcm' -as [type]
+            if ($null -eq $gcm) { _warn 'AesGcm indisponible sur cette plateforme'; return $null }
+            $aes = New-Object $gcm $enc
+            $pt = New-Object byte[] $ct.Length
+            $aes.Decrypt($nonce, $ct, $tag, $pt)
+            return [Text.Encoding]::UTF8.GetString($pt)
+        } elseif ($ver -eq 2) {
+            $iv = _slice $raw 21 16
+            $tag = _slice $raw 37 32
+            $ct = _slice $raw 69 ($raw.Length - 69)
+            $exp = [Security.Cryptography.HMACSHA256]::new($mac).ComputeHash([byte[]]($iv + $ct))
+            if (-not [Linq.Enumerable]::SequenceEqual([byte[]]$exp, [byte[]]$tag)) {
+                _warn 'integrite HMAC invalide (mauvaise cle ou donnees alterees)'
+                return $null
+            }
+            $aes = [Security.Cryptography.Aes]::Create()
+            $aes.Key = $enc; $aes.IV = $iv; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'
+            $pt = $aes.CreateDecryptor().TransformFinalBlock($ct, 0, $ct.Length)
+            return [Text.Encoding]::UTF8.GetString($pt)
+        }
+        _warn ('version de sceau inconnue : ' + $ver); return $null
     } catch { _warn $_; return $null }
 }
 '''
@@ -844,6 +1004,26 @@ function _mathx_noise($x, $seed = 0) {
     $n2 = _mhash ($xi + 1) $seed
     return (_mathx_lerp $n1 $n2 $xf)
 }
+'''
+
+SYS_MODULES['path'] = r'''
+# --- path : chemins et noms de fichiers ------------------------------------
+function _path_join($a, $b) { return [IO.Path]::Combine([string]$a, [string]$b) }
+function _path_abs($p) { return (_abs $p) }
+function _path_norm($p) { return [IO.Path]::GetFullPath([string]$p) }
+function _path_base($p) {
+    $p = ([string]$p) -replace '[\\/]+$',''
+    if ($p -eq '') { return '' }
+    return [IO.Path]::GetFileName($p)
+}
+function _path_dir($p) {
+    $p = ([string]$p) -replace '[\\/]+$',''
+    if ($p -match '^[A-Za-z]:$') { return $p + '\' }
+    return [IO.Path]::GetDirectoryName($p)
+}
+function _path_ext($p) { return [IO.Path]::GetExtension([string]$p) }
+function _path_tmpdir() { return [IO.Path]::GetTempPath() }
+function _path_exists($p) { return (Test-Path -LiteralPath ([string]$p)) }
 '''
 
 SYS_MODULES['fs'] = r'''
@@ -1581,7 +1761,7 @@ function _usb_list() {
 SYS_MODULES['json'] = r'''
 # --- json : (de)serialisation des tables ---------------------------------------------
 function _jval($v) {
-    if ($v -is [hashtable] -and $v.ContainsKey('a') -and $v.ContainsKey('h')) {
+    if (_istbl $v) {
         if ($v.h.Count -eq 0) {
             $l = New-Object System.Collections.ArrayList
             foreach ($x in $v.a) { [void]$l.Add((_jval $x)) }
@@ -1657,7 +1837,7 @@ function _str_hash($s, $algo = 'SHA256') {
 '''
 
 
-# --- PATCH v2.3 : double cle (avec et sans underscore) ---
+# --- double cle (avec et sans underscore) ---
 def _sys_builtins():
     out = {}
     for mod, code in SYS_MODULES.items():
@@ -1672,7 +1852,7 @@ SYS_BUILTINS = _sys_builtins()
 BUILTINS.update(SYS_BUILTINS)
 
 
-# --- PATCH v2.3 : services sensibles signales a titre informatif ---
+# --- services sensibles signales a titre informatif ---
 SENSITIVE_SERVICES = {
     'wuauserv': 'Windows Update (protégé par WaaSMedic depuis Win10 1809)',
     'waasmedicsvc': 'Windows Update Medic (protection du service WU)',
@@ -1690,31 +1870,8 @@ SENSITIVE_SERVICES = {
 }
 
 
-def check_sensitive_services(ast):
-    """Retourne la liste des services sensibles ciblés par le script Lua."""
-    found = set()
-    for node in ast:
-        for sub in walk_iter(node):
-            if sub[0] == 'local':
-                for expr in sub[2]:
-                    for s in _strings_in(expr):
-                        if s.lower() in SENSITIVE_SERVICES:
-                            found.add(s.lower())
-            elif sub[0] == 'assign':
-                for expr in sub[2]:
-                    for s in _strings_in(expr):
-                        if s.lower() in SENSITIVE_SERVICES:
-                            found.add(s.lower())
-            elif sub[0] == 'call':
-                for arg in sub[2]:
-                    for s in _strings_in(arg):
-                        if s.lower() in SENSITIVE_SERVICES:
-                            found.add(s.lower())
-    return sorted(found)
-
-
 def walk_iter(node):
-    """Iterateur simple sur un sous-arbre AST."""
+    """Iterateur simple sur un sous-arbre AST (tuples et listes)."""
     stack = [node]
     while stack:
         n = stack.pop()
@@ -1730,19 +1887,16 @@ def walk_iter(node):
                         stack.append(y)
 
 
-def _strings_in(expr):
-    out = []
-    if not isinstance(expr, tuple):
-        return out
-    if expr[0] == 'str':
-        out.append(expr[1])
-    for x in expr:
-        if isinstance(x, tuple):
-            out.extend(_strings_in(x))
-        elif isinstance(x, list):
-            for y in x:
-                out.extend(_strings_in(y))
-    return out
+def check_sensitive_services(ast):
+    """Retourne les services sensibles ciblés : toute chaîne littérale de l'AST
+    est comparée (v2.3 ne scannait que local/assign/arguments d'appel)."""
+    found = set()
+    for node in walk_iter(('root', ast)):
+        if node[0] == 'str' and isinstance(node[1], str):
+            low = node[1].lower()
+            if low in SENSITIVE_SERVICES:
+                found.add(low)
+    return sorted(found)
 
 
 def api_listing():
@@ -1763,7 +1917,9 @@ RESERVED = {'args', 'input', 'error', 'host', 'home', 'pid', 'pwd', 'true', 'fal
             'executioncontext', 'lastexitcode', 'stacktrace', 'psversiontable',
             'env', 'pshome', 'ofs', 'confirmpreference', 'verbosepreference',
             'debugpreference', 'erroractionpreference', 'dryrun'}
-CMP = {'==': '-eq', '~=': '-ne', '!=': '-ne', '<': '-lt', '<=': '-le', '>': '-gt', '>=': '-ge'}
+# v3 : comparaisons SENSIBLES A LA CASSE (v2.3 : -eq insensible -> "abc" == "ABC" vrai)
+CMP = {'==': '-ceq', '~=': '-cne', '!=': '-cne', '<': '-clt', '<=': '-cle',
+       '>': '-cgt', '>=': '-cge'}
 BITOPS = {'&': '-band', '|': '-bor', '^^': '-bxor', '<<': '-shl', '>>': '-shr'}
 
 
@@ -1820,7 +1976,7 @@ def walk(stmts, fn):
 
 
 # ----------------------------------------------------------------------------
-# Generateur
+# Generateur (v3)
 # ----------------------------------------------------------------------------
 class Gen:
     def __init__(self, ast):
@@ -1870,13 +2026,14 @@ class Gen:
         return '$' + safe(n)
 
     def cond(self, e):
+        """Expression en position de condition (booléenne)."""
         k = e[0]
         if k == 'bool':
             return '$true' if e[1] else '$false'
         if k == 'nil':
             return '$false'
         if k == 'bin' and (e[1] in CMP or e[1] in ('and', 'or')):
-            return self.expr(e)
+            return f'(_truthy {self.expr(e)})'
         if k == 'un' and e[1] == 'not':
             return self.expr(e)
         return f'(_truthy {self.expr(e)})'
@@ -1931,8 +2088,17 @@ class Gen:
                 return f'(-bnot [int]{self.expr(x)})'
         if k == 'bin':
             op, l, r = e[1], e[2], e[3]
-            if op in ('and', 'or'):
-                return f'({self.cond(l)} -{op} {self.cond(r)})'
+            # v3 : and/or preservent les valeurs (court-circuit via scriptblock)
+            if op == 'or':
+                t = self.new_tmp()
+                return (f'(& {{ {t} = {self.expr(l)}; '
+                        f'if (_truthy {t}) {{ return {t} }}; '
+                        f'return {self.expr(r)} }})')
+            if op == 'and':
+                t = self.new_tmp()
+                return (f'(& {{ {t} = {self.expr(l)}; '
+                        f'if (-not (_truthy {t})) {{ return {t} }}; '
+                        f'return {self.expr(r)} }})')
             if op == '..':
                 parts = []
                 self._flatten_concat(e, parts)
@@ -1947,7 +2113,7 @@ class Gen:
                 return f'({L} {op} {R})'
             if op == '%':
                 return f'(_mod {L} {R})'
-            if op == '\\':
+            if op in ('\\', '//'):
                 return f'([math]::Floor({L} / {R}))'
             if op == '^':
                 return f'([math]::Pow({L}, {R}))'
@@ -1987,38 +2153,42 @@ class Gen:
             return f'{self.var(target[1])} = {val}'
         return f'_set {self.expr(target[1])} {self.expr(target[2])} {val}'
 
+    def _store(self, n, val, declare):
+        """Ecrit val dans n : nom (str, local/global) ou cible d'AST (tuple : t[i], t.x)."""
+        if isinstance(n, tuple):
+            self.emit(self.assign_to(n, val))
+            return
+        if declare:
+            self.declare(n)
+        self.emit(f'{self.var(n)} = {val}')
+
+    def _emit_multi(self, names, exprs, declare):
+        """Affectation locale/multiple, avec deballage d'un appel a retour multiple."""
+        if len(names) > 1 and len(exprs) == 1 and exprs[0][0] == 'call':
+            tmp = self.new_tmp()
+            self.emit(f'{tmp} = {self.expr(exprs[0])}')
+            for i, n in enumerate(names):
+                self._store(n, f'{tmp}[{i}]', declare)
+            return
+        vals = [self.expr(e) for e in exprs]
+        vals += ['$null'] * (len(names) - len(vals))
+        if len(names) == 1:
+            self._store(names[0], vals[0], declare)
+        else:
+            tmps = []
+            for v in vals[:len(names)]:
+                t = self.new_tmp()
+                self.emit(f'{t} = {v}')
+                tmps.append(t)
+            for n, t in zip(names, tmps):
+                self._store(n, t, declare)
+
     def stmt(self, s):
         k = s[0]
         if k == 'local':
-            names, exprs = s[1], s[2]
-            vals = [self.expr(e) for e in exprs]
-            vals += ['$null'] * (len(names) - len(vals))
-            if len(names) == 1:
-                self.declare(names[0])
-                self.emit(f'{self.var(names[0])} = {vals[0]}')
-            else:
-                tmps = []
-                for v in vals[:len(names)]:
-                    t = self.new_tmp()
-                    self.emit(f'{t} = {v}')
-                    tmps.append(t)
-                for n, t in zip(names, tmps):
-                    self.declare(n)
-                    self.emit(f'{self.var(n)} = {t}')
+            self._emit_multi(s[1], s[2], declare=True)
         elif k == 'assign':
-            targets, exprs = s[1], s[2]
-            vals = [self.expr(e) for e in exprs]
-            vals += ['$null'] * (len(targets) - len(vals))
-            if len(targets) == 1:
-                self.emit(self.assign_to(targets[0], vals[0]))
-            else:
-                tmps = []
-                for v in vals[:len(targets)]:
-                    t = self.new_tmp()
-                    self.emit(f'{t} = {v}')
-                    tmps.append(t)
-                for tg, t in zip(targets, tmps):
-                    self.emit(self.assign_to(tg, t))
+            self._emit_multi(s[1], s[2], declare=False)
         elif k == 'callstat':
             self.emit('$null = ' + self.expr(s[1]))
         elif k == 'if':
@@ -2049,7 +2219,14 @@ class Gen:
         elif k == 'forin':
             self.gen_forin(s)
         elif k == 'return':
-            self.emit('return' if s[1] is None else f'return {self.expr(s[1])}')
+            # v3 : retours multiples -> tableau PowerShell
+            if s[1] is None:
+                self.emit('return')
+            elif len(s[1]) == 1:
+                self.emit(f'return {self.expr(s[1][0])}')
+            else:
+                vals = ', '.join(self.expr(e) for e in s[1])
+                self.emit(f'return , @({vals})')
         elif k == 'break':
             self.emit('break')
         elif k == 'do':
@@ -2062,19 +2239,19 @@ class Gen:
     def gen_for(self, s):
         _, name, start, stop, step, body = s
         st_val = self.expr(start)
-        n = self.tmp = self.tmp + 1
         cstop = const_num(stop)
         cstep = 1.0 if step is None else const_num(step)
-        if cstop is not None:
-            e_val = self.expr(stop)
-        else:
-            e_val = f'$_e{n}'
-            self.emit(f'{e_val} = {self.expr(stop)}')
-        if cstep is None:
-            s_val = f'$_s{n}'
-            self.emit(f'{s_val} = {self.expr(step)}')
-        else:
-            s_val = self.expr(step) if step is not None else '1'
+        if cstep == 0.0:
+            raise TranspileError("'for' avec un pas nul (erreur en Lua 5.4 : "
+                                 "'for step is zero')")
+        te = self.new_tmp() if cstop is None else None
+        ts = self.new_tmp() if cstep is None else None
+        if te is not None:
+            self.emit(f'{te} = {self.expr(stop)}')
+        if ts is not None:
+            self.emit(f'{ts} = {self.expr(step)}')
+        e_val = te if te is not None else self.expr(stop)
+        s_val = ts if ts is not None else (self.expr(step) if step is not None else '1')
         self.scopes.append({name})
         v = self.var(name)
         if cstep is not None:
@@ -2103,8 +2280,7 @@ class Gen:
         else:
             if len(names) != 2:
                 raise TranspileError('for ... in pairs(t) : deux variables attendues (k, v)')
-            tmp = f'$_p{self.tmp + 1}'
-            self.tmp += 1
+            tmp = self.new_tmp()
             self.emit(f'foreach ({tmp} in (_pairs {src})) {{')
             self.ind += 1
             self.emit(f'{self.var(names[0])} = {tmp}[0]')
@@ -2174,7 +2350,7 @@ def extract_lua(text):
 
 def assemble_output(gen, body):
     """Assemble le .ps1 final. Toujours un param([switch]$DryRun)."""
-    parts = ['# Genere par pico2ps - ne pas editer a la main\n']
+    parts = ['# Genere par pico2ps v3.0 - ne pas editer a la main\n']
     parts.append('[CmdletBinding()]\nparam([switch]$DryRun)\n')
     parts.append(RUNTIME)
     mods = [m for m in SYS_MODULES if m != 'core' and m in gen.used_mods]
@@ -2195,8 +2371,9 @@ def transpile(src, loop=False):
 
 def main():
     ap = argparse.ArgumentParser(
-        description='Transpile PICO-8 (Lua) vers PowerShell (v2.3 Vivant)')
+        description=f'pico2ps {VERSION} — Transpile PICO-8 (Lua) vers PowerShell')
     ap.add_argument('input', nargs='?')
+    ap.add_argument('--version', '-V', action='version', version=f'pico2ps {VERSION}')
     ap.add_argument('--api', action='store_true',
                     help='liste les fonctions systeme disponibles')
     ap.add_argument('--list-modules', action='store_true',
@@ -2254,7 +2431,7 @@ def main():
             st = ast_stats(ast)
             note('AST : ' + ', '.join(f'{k}×{v}' for k, v in sorted(st.items())))
 
-        # --- v2.3 : alerte services sensibles ---
+        # --- alerte services sensibles (toutes chaines litterales) ---
         sens = check_sensitive_services(ast)
         for s in sens:
             caution(f'service sensible cible : {s} ({SENSITIVE_SERVICES[s]})')
